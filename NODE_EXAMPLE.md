@@ -4,7 +4,42 @@ The clock is the **master hub**. Any number of ESP32 boards ("nodes") can
 send it messages and sensor readings, and the hub broadcasts messages and a
 sync packet back out to all of them.
 
+## Ready-made node sketch
+
+`examples/nexus_node_c3/` is a complete ESP32-C3 node that never joins WiFi.
+Open it, set `NODE_NAME`, and flash. Each wake it:
+
+1. **pings** the hub with a random number. The hub shows that number on its
+   display and answers with the number plus one.
+2. **sends** a line of text, which the hub stores in its 15 slot queue.
+3. **polls** for anything waiting for it, such as a message you typed on your
+   phone, and the hub hands those over.
+
+It finds the hub's channel by itself on the first wake and remembers it in
+RTC memory, so later wakes are immediate.
+
+Leave `DEEP_SLEEP_SECONDS` at `0` for the first test: the node stays awake and
+repeats the exchange every 15 seconds so you can watch it in the Serial
+Monitor. Set it to `30` once you have seen it work, and it will deep sleep
+between wakes instead.
+
+Expected output:
+
+```
+=== NEXUS node c3-test, wake #1 ===
+my MAC A0:B7:65:11:22:33
+found the hub on channel 6
+ping  4821 ...
+  hub replied 4822  (expected 4822)  OK
+send  "C3 awake, wake #1" ...
+  hub says stored, holding 3
+poll  ...
+   inbox: [panel] Dinner is ready
+  received 1 message(s)
+```
+
 ## 1. Match the channel
+
 
 ESP-NOW only works when both boards are on the same WiFi channel. The hub is
 joined to your router, so it sits on the router's channel and cannot move.
@@ -14,6 +49,9 @@ joined to your router, so it sits on the router's channel and cannot move.
 2. Set that same channel on every node with `esp_wifi_set_channel(...)`, as
    in the sketch below.
 3. If you change your router's channel, re-read the panel and update the nodes.
+
+The node sketch above does this scan for you. The rest of this page is for
+writing your own node from scratch.
 
 ## 2. Copy the packet header
 

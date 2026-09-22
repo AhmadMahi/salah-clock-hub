@@ -131,12 +131,17 @@ a pixel ruler, then adjust until every line is sharp.
 
 ## ESP-NOW nodes
 
-See [NODE_EXAMPLE.md](NODE_EXAMPLE.md) for a ready to flash node sketch and
-the packet format. Copy `espnow_packet.h` to each node so both sides agree on
+`examples/nexus_node_c3/` is a complete ESP32-C3 node that never joins WiFi:
+it wakes, pings the hub with a random number (which the hub shows on screen
+and answers with number plus one), sends a message for the queue, collects
+anything waiting for it, and sleeps. It finds the hub's channel by itself.
+
+See [NODE_EXAMPLE.md](NODE_EXAMPLE.md) for that sketch and the packet format. Copy `espnow_packet.h` to each node so both sides agree on
 the layout.
 
 The hub sits on your router's WiFi channel and cannot move off it, so every
-node must use that same channel. The panel shows it under **Nodes**.
+node must use that same channel. The panel shows it under **Nodes**, and the
+example node scans for it automatically.
 
 ## HTTP API
 

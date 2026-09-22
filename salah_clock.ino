@@ -99,7 +99,7 @@ const char* HOSTNAME = "salah-clock";           // -> http://salah-clock.local
 #define DEVICE_NAME    "NEXUS"
 #define DEVICE_TAGLINE "MASTER HUB"
 
-#define FW_VERSION "3.3.0"
+#define FW_VERSION "3.4.0"
 #define OTA_REPO   "AhmadMahi/salah-clock-hub"
 #define OTA_ASSET  "salah_clock_hub.bin"
 
@@ -188,6 +188,7 @@ bool espNowEnabled   = true;    // ESP-NOW hub on/off
 bool relayMessages   = true;    // rebroadcast node messages to the other nodes
 bool shareSync       = true;    // broadcast time + prayer times to nodes
 bool otaAuto         = true;    // check GitHub for new firmware on boot and daily
+bool ackMessages     = true;    // answer a node when it pings, sends or polls
 
 uint8_t alertMask    = 0x1F;    // bit0..4 = Fajr, Dhuhr, Asr, Maghrib, Isha
 int slotMinutes      = 1;       // show the message list every N minutes
@@ -273,6 +274,7 @@ struct MsgEntry {
   String   from;
   time_t   at;          // 0 when the clock was not synced yet
   unsigned long ms;
+  uint32_t serial;      // ever increasing, used for per-node delivery
   uint8_t  src;
   bool     unread;
 };
@@ -280,6 +282,7 @@ struct MsgEntry {
 MsgEntry msgs[MAX_MSGS];
 int  msgCount  = 0;
 int  msgUnread = 0;
+uint32_t msgSerial = 0;      // last serial handed out
 unsigned long msgLastArrival = 0;
 
 // wrapped lines of the message being shown
@@ -299,6 +302,7 @@ struct NodeInfo {
   char     name[16];
   unsigned long lastMs;
   uint32_t packets;
+  uint32_t lastSerial;      // highest message serial this node has collected
   int8_t   rssi;
   bool     used;
 };
@@ -359,6 +363,11 @@ int  alertVerse          = 0;
 unsigned long alertStart = 0;
 
 unsigned long calibUntil = 0;
+
+// a node pinged us: show its number for a few seconds
+unsigned long pingUntil = 0;
+String   pingFrom = "";
+uint32_t pingNum  = 0;
 
 int    cachedVerse   = -1;
 String verseLines[4];
@@ -531,6 +540,7 @@ void loadSettings() {
   relayMessages   = prefs.getBool("relay",   true);
   shareSync       = prefs.getBool("sync",    true);
   otaAuto         = prefs.getBool("ota",     true);
+  ackMessages     = prefs.getBool("ack",     true);
 
   alertMask       = prefs.getUChar("mask", 0x1F);
   slotMinutes     = prefs.getInt("slot",     1);
@@ -606,6 +616,7 @@ void saveSettings() {
   prefs.putBool("relay",   relayMessages);
   prefs.putBool("sync",    shareSync);
   prefs.putBool("ota",     otaAuto);
+  prefs.putBool("ack",     ackMessages);
 
   prefs.putUChar("mask", alertMask);
   prefs.putInt("slot",     slotMinutes);
@@ -654,6 +665,7 @@ void pushMessage(const String& textIn, const String& fromIn, uint8_t src) {
   msgs[0].from   = from;
   msgs[0].at     = getNow(t) ? time(nullptr) : 0;
   msgs[0].ms     = millis();
+  msgs[0].serial = ++msgSerial;
   msgs[0].src    = src;
   msgs[0].unread = true;
 
@@ -1081,6 +1093,69 @@ bool broadcastMessage(const String& text, const String& from) {
   return nowSend(p);
 }
 
+// Unicast to one node. Falls back to a broadcast if the peer slot is full,
+// which still reaches the node, just less efficiently.
+bool nowSendTo(const uint8_t* mac, NowPacket& p) {
+  if (!espNowReady) return false;
+
+  if (!esp_now_is_peer_exist(mac)) {
+    esp_now_peer_info_t peer;
+    memset(&peer, 0, sizeof(peer));
+    memcpy(peer.peer_addr, mac, 6);
+    peer.channel = 0;                    // 0 = whatever channel we are on
+    peer.encrypt = false;
+    peer.ifidx   = WIFI_IF_STA;
+    if (esp_now_add_peer(&peer) != ESP_OK) return nowSend(p);
+  }
+  if (esp_now_send(mac, (const uint8_t*)&p, sizeof(p)) == ESP_OK) {
+    nowTxCount++;
+    return true;
+  }
+  return nowSend(p);
+}
+
+// The hub's answer to a PING, a MSG or a POLL
+void sendAck(const uint8_t* mac, uint32_t seq, int count, const char* note) {
+  if (!espNowReady || !ackMessages) return;
+
+  NowPacket p;
+  fillPacket(p, PKT_ACK);
+  p.seq       = seq;
+  p.prayer[0] = (uint16_t)count;
+  p.prayer[1] = (uint16_t)msgCount;
+  strncpy(p.text, note, sizeof(p.text) - 1);
+
+  struct tm t;
+  p.epoch = getNow(t) ? (uint32_t)time(nullptr) : 0;
+
+  nowSendTo(mac, p);
+}
+
+// A node asked for whatever it has not collected yet
+void deliverMailbox(const uint8_t* mac, int ni) {
+  const int MAX_PER_POLL = 5;
+  int sent = 0;
+
+  // oldest first, so they arrive in the order they were written
+  for (int i = msgCount - 1; i >= 0 && sent < MAX_PER_POLL; i--) {
+    if (msgs[i].serial <= nodes[ni].lastSerial) continue;
+
+    NowPacket p;
+    fillPacket(p, PKT_MSG);
+    p.seq = msgs[i].serial;
+    strncpy(p.from, msgs[i].from.c_str(), sizeof(p.from) - 1);
+    strncpy(p.text, msgs[i].text.c_str(), sizeof(p.text) - 1);
+    nowSendTo(mac, p);
+
+    nodes[ni].lastSerial = msgs[i].serial;
+    sent++;
+    delay(10);                            // let the node's receive queue keep up
+  }
+
+  Serial.printf("POLL from %s: sent %d\n", nodes[ni].name, sent);
+  sendAck(mac, 0, sent, "delivered");
+}
+
 // Time + prayer times + weather, so every node can show the same data
 void broadcastSync() {
   if (!espNowReady || !shareSync) return;
@@ -1121,7 +1196,8 @@ int touchNode(const uint8_t* mac, const char* name, int8_t rssi) {
 
   if (!nodes[i].used || memcmp(nodes[i].mac, mac, 6) != 0) {
     memcpy(nodes[i].mac, mac, 6);
-    nodes[i].packets = 0;
+    nodes[i].packets    = 0;
+    nodes[i].lastSerial = 0;
   }
   nodes[i].used   = true;
   nodes[i].lastMs = millis();
@@ -1172,6 +1248,22 @@ void processEspNow() {
         switch (p.type) {
           case PKT_MSG:
             handleNowMessage(String(p.text), from);
+            sendAck(item.mac, p.seq, msgCount, "stored");
+            break;
+
+          case PKT_PING:
+            // show the number the node sent, then answer with number + 1
+            pingFrom  = from;
+            pingNum   = p.seq;
+            pingUntil = millis() + 5000UL;
+            lastDrawn = -99;
+            Serial.printf("PING from %s: %lu -> %lu\n",
+                          from.c_str(), (unsigned long)p.seq, (unsigned long)(p.seq + 1));
+            sendAck(item.mac, p.seq + 1, msgCount, "pong");
+            break;
+
+          case PKT_POLL:
+            deliverMailbox(item.mac, ni);
             break;
 
           case PKT_TELEM:
@@ -1185,7 +1277,6 @@ void processEspNow() {
             if (p.text[0]) handleNowMessage(String(p.text), from);
             break;
 
-          case PKT_PING:
           default:
             break;
         }
@@ -1207,6 +1298,7 @@ void processEspNow() {
       buf[n] = 0;
       int ni = touchNode(item.mac, "node", item.rssi);
       handleNowMessage(String(buf), String(nodes[ni].name));
+      sendAck(item.mac, 0, msgCount, "stored");
     }
   }
 }
@@ -2532,6 +2624,48 @@ void drawAlertScreen(unsigned long el) {
 }
 
 // =====================================================
+// NODE PING SCREEN
+// =====================================================
+//  Shown for a few seconds when a node sends a number.
+
+void drawPingScreen() {
+  u8g2.clearBuffer();
+  u8g2.setDrawColor(1);
+
+  u8g2.setFont(FONT_SMALL);
+  pStr(MARGIN, yHead(), "NODE PING");
+  pRight(clip(pingFrom, 56), yHead());
+  pHLine(MARGIN, yRule(), CONTENT_W);
+
+  int bodyTop = yRule() + 3;
+  int bodyH   = areaBot() - bodyTop;
+
+  String got = String((unsigned long)pingNum);
+  String rep = String((unsigned long)(pingNum + 1));
+
+  if (areaH() >= 42) {
+    // label on the left, number on the right, both rows anchored to the bottom
+    int l2 = areaBot() - 1;                  // what we sent back
+    int l1 = l2 - 18;                        // what we heard
+
+    u8g2.setFont(FONT_SMALL);
+    pStr(MARGIN, l1, "GOT");
+    u8g2.setFont(u8g2_font_helvB10_tr);
+    pRight(clip(got, CONTENT_W - 30), l1);
+
+    u8g2.setFont(FONT_SMALL);
+    pStr(MARGIN, l2, "SENT");
+    u8g2.setFont(u8g2_font_helvB14_tr);
+    pRight(clip(rep, CONTENT_W - 34), l2);
+  } else {
+    u8g2.setFont(FONT_BODY);
+    pCenter(got + " > " + rep, bodyTop + bodyH / 2 + 4);
+  }
+
+  u8g2.sendBuffer();
+}
+
+// =====================================================
 // WIFI SETUP SCREEN
 // =====================================================
 
@@ -2672,6 +2806,16 @@ void updateDisplay() {
   if (apMode) {
     if (frameDue(980, 200)) drawApScreen();
     return;
+  }
+
+  // ---- 0b. a node just pinged us: show its number briefly
+  if (pingUntil && !alertActive) {
+    if (now < pingUntil) {
+      if (frameDue(970, 200)) drawPingScreen();
+      return;
+    }
+    pingUntil = 0;
+    lastDrawn = -99;
   }
 
   // ---- 1. calibration overlay wins over everything except alerts
@@ -2872,6 +3016,7 @@ input[type=checkbox]:checked::after{left:21px}
   <label class="row"><div>ESP-NOW hub<small>Receive from and send to other ESP32 boards</small></div><input type="checkbox" data-k="now"></label>
   <label class="row"><div>Relay node messages<small>Pass a message from one node on to all the others</small></div><input type="checkbox" data-k="relay"></label>
   <label class="row"><div>Share time and prayer times<small>Broadcast a sync packet every minute</small></div><input type="checkbox" data-k="sync"></label>
+  <label class="row"><div>Answer nodes<small>Replies to a ping with the number plus one, confirms stored messages, and hands over the queue when a node asks</small></div><input type="checkbox" data-k="ack"></label>
   <label class="field"><span>Hub name (sent with every packet)</span><input type="text" data-k="hubname" maxlength="15"></label>
   <div id="nlist"></div>
 </section>
@@ -3374,6 +3519,7 @@ void handleState() {
   jBool(o, "relay",   relayMessages);
   jBool(o, "sync",    shareSync);
   jBool(o, "ota",     otaAuto);
+  jBool(o, "ack",     ackMessages);
   jBool(o, "a0", alertMask & 1);
   jBool(o, "a1", alertMask & 2);
   jBool(o, "a2", alertMask & 4);
@@ -3413,6 +3559,7 @@ void handleSettings() {
   relayMessages   = argBool("relay",   relayMessages);
   shareSync       = argBool("sync",    shareSync);
   otaAuto         = argBool("ota",     otaAuto);
+  ackMessages     = argBool("ack",     ackMessages);
 
   bool wasWx = weatherEnabled;
   weatherEnabled = argBool("wx", weatherEnabled);
