@@ -24,8 +24,9 @@
 
    SETUP
      Board: any ESP32-C3 board (ESP32 Arduino core 2.x or 3.x)
-     Put espnow_packet.h next to this file. It must be byte for byte
-     the same file the hub uses.
+     This is a single file. Nothing else to copy, no libraries to
+     install beyond the ESP32 core itself. Paste it into a new sketch
+     and upload.
   ================================================================
 */
 
@@ -33,7 +34,41 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
-#include "espnow_packet.h"
+
+// ================================================================
+//  PACKET FORMAT  -  must stay byte for byte identical to
+//  espnow_packet.h in the hub sketch. If you change one, change both.
+// ================================================================
+
+#define NOW_MAGIC   0x5A4Cu      // 'ZL'
+#define NOW_VERSION 1
+
+enum {
+  PKT_MSG   = 1,   // a text message   node -> hub, or hub -> node
+  PKT_TELEM = 2,   // temperature / humidity from a sensor node
+  PKT_SYNC  = 3,   // hub -> nodes: time, prayer times, weather
+  PKT_PING  = 4,   // node -> hub: "here is a number, show it and answer me"
+  PKT_ACK   = 5,   // hub -> node: the reply to PING, MSG or POLL
+  PKT_POLL  = 6    // node -> hub: "send me anything I have not collected"
+};
+
+struct __attribute__((packed)) NowPacket {
+  uint16_t magic;           // must be NOW_MAGIC
+  uint8_t  version;         // NOW_VERSION
+  uint8_t  type;            // PKT_*
+  uint32_t seq;             // sender's own counter
+  char     from[16];        // node name, zero terminated
+  char     text[101];       // message text, zero terminated
+  uint8_t  reserved;
+  float    temp;            // Celsius, NAN when unused
+  float    hum;             // percent,  NAN when unused
+  uint16_t prayer[5];       // Fajr..Isha, minutes since midnight, 0xFFFF = unknown
+  uint32_t epoch;           // unix time, hub -> nodes only
+};
+
+// If this ever fails, the hub and this node disagree about the packet
+// layout and they will not understand each other.
+static_assert(sizeof(NowPacket) == 148, "NowPacket layout changed - update both sides");
 
 // ---------------- settings ----------------
 

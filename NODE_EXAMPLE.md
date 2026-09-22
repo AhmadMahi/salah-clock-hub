@@ -6,8 +6,11 @@ sync packet back out to all of them.
 
 ## Ready-made node sketch
 
-`examples/nexus_node_c3/` is a complete ESP32-C3 node that never joins WiFi.
-Open it, set `NODE_NAME`, and flash. Each wake it:
+[`examples/nexus_node_c3/nexus_node_c3.ino`](examples/nexus_node_c3/nexus_node_c3.ino)
+is a complete ESP32-C3 node that never joins WiFi. It is a **single file** with
+the packet format built in, so there is nothing else to copy and no library to
+install beyond the ESP32 core. Paste it into a new sketch, set `NODE_NAME`, and
+upload. Each wake it:
 
 1. **pings** the hub with a random number. The hub shows that number on its
    display and answers with the number plus one.
@@ -55,8 +58,10 @@ writing your own node from scratch.
 
 ## 2. Copy the packet header
 
-Copy `espnow_packet.h` from this folder into your node's sketch folder. Both
-sides must use the exact same struct.
+Copy `espnow_packet.h` from this folder into your node's sketch folder, or
+paste the struct inline as the single file example does. Both sides must use
+the exact same struct; each carries a `static_assert` on its size so a
+mismatch fails to compile rather than failing silently on air.
 
 ## 3. Node sketch (sender + receiver)
 

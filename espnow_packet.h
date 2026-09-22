@@ -70,4 +70,8 @@ struct __attribute__((packed)) NowPacket {
   uint32_t epoch;           // unix time, hub -> nodes only
 };
 
+// If this ever fails, the hub and this node disagree about the packet
+// layout and they will not understand each other.
+static_assert(sizeof(NowPacket) == 148, "NowPacket layout changed - update both sides");
+
 #endif
