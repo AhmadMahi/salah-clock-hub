@@ -28,7 +28,8 @@ enum {
   PKT_SYNC  = 3,   // hub -> nodes: time, prayer times, weather
   PKT_PING  = 4,   // node -> hub: "here is a number, show it and answer me"
   PKT_ACK   = 5,   // hub -> node: the reply to PING, MSG or POLL
-  PKT_POLL  = 6    // node -> hub: "send me anything I have not collected"
+  PKT_POLL  = 6,   // node -> hub: "send me anything I have not collected"
+  PKT_RECV  = 7    // node -> hub: "I showed message <seq>, you can drop it"
 };
 
 /*
@@ -44,6 +45,11 @@ enum {
          have not collected yet, oldest first, up to 5 per poll, then
          one PKT_ACK. Each node is tracked separately, so two nodes
          never steal each other's messages and nothing arrives twice.
+
+  RECV   after you have shown a message, send PKT_RECV with seq set to
+         that message's serial (the seq the hub put on it). The hub
+         marks it delivered and removes it from the queue, so it is
+         never sent twice and does not sit on the hub's screen.
 
   ACK    from the hub, always carries:
            seq        your number + 1 after PING, your seq after MSG,

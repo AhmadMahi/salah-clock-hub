@@ -11,6 +11,9 @@
    - Every minute it slides to the MESSAGE QUEUE, cycles through what
      arrived, and slides back. Empty queue shows "No messages".
      Optional extra slides for next prayer and weather (off by default).
+   - MQTT in, ESP-NOW out. Publish to nexus/msg from anywhere and
+     the message waits in the queue until a sleeping node wakes and
+     asks for it. The node shows it, confirms, and the hub drops it.
    - ESP-NOW master hub
        * receives messages and sensor data from other ESP32 nodes
        * keeps the last 15 messages in a queue (newest first)
@@ -41,6 +44,7 @@
    REQUIRED LIBRARIES (Library Manager)
      - U8g2
      - ArduinoJson (v6.15+ or v7)
+     - ArduinoMqttClient
 
    BOARD SETTINGS
      Board           : any ESP32 dev board (Arduino core 2.x or 3.x)
@@ -65,6 +69,7 @@
 #include <esp_wifi.h>
 #include <Update.h>
 #include <DNSServer.h>
+#include <ArduinoMqttClient.h>
 #include "espnow_packet.h"
 
 // ArduinoJson v6 / v7 compatibility
@@ -93,13 +98,25 @@
   #define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
 #endif
 
+// MQTT broker details, also seeded from secrets.h into flash on first boot
+// and editable from the web panel afterwards.
+#ifndef MQTT_HOST
+  #define MQTT_HOST "your-broker.s1.eu.hivemq.cloud"
+  #define MQTT_PORT 8883
+  #define MQTT_USER ""
+  #define MQTT_PASS ""
+#endif
+#ifndef MQTT_BASE
+  #define MQTT_BASE "nexus"
+#endif
+
 const char* HOSTNAME = "salah-clock";           // -> http://salah-clock.local
 
 // ---- firmware identity and over-the-air updates ----
 #define DEVICE_NAME    "NEXUS"
 #define DEVICE_TAGLINE "MASTER HUB"
 
-#define FW_VERSION "3.5.0"
+#define FW_VERSION "3.6.0"
 #define OTA_REPO   "AhmadMahi/salah-clock-hub"
 #define OTA_ASSET  "salah_clock_hub.bin"
 
@@ -189,6 +206,8 @@ bool relayMessages   = true;    // rebroadcast node messages to the other nodes
 bool shareSync       = true;    // broadcast time + prayer times to nodes
 bool otaAuto         = true;    // check GitHub for new firmware on boot and daily
 bool ackMessages     = true;    // answer a node when it pings, sends or polls
+bool mqttEnabled     = true;    // connect to the MQTT broker
+bool deleteOnReceipt = true;    // drop a message once a node confirms it showed it
 
 uint8_t alertMask    = 0x1F;    // bit0..4 = Fajr, Dhuhr, Asr, Maghrib, Isha
 int slotMinutes      = 1;       // show the message list every N minutes
@@ -210,6 +229,21 @@ DNSServer   dnsServer;
 // ---- WiFi credentials + setup portal ----
 String wifiSsid = "";
 String wifiPass = "";
+
+// ---- MQTT ----
+String mqttHost = "";
+int    mqttPort = 8883;
+String mqttUser = "";
+String mqttPass = "";
+String mqttBase = MQTT_BASE;          // topics live under this prefix
+
+WiFiClientSecure mqttNet;
+MqttClient       mqtt(mqttNet);
+bool          mqttReady    = false;
+unsigned long nextMqttTry  = 0;
+uint32_t      mqttRxCount  = 0;
+uint32_t      mqttTxCount  = 0;
+String        mqttStatus   = "not started";
 bool   apMode      = false;        // true while the setup portal is running
 String apSsid      = "";
 String apPass      = "nexus1234";  // WPA2 needs at least 8 characters
@@ -267,7 +301,7 @@ bool weatherValid() {
 const int MAX_MSGS   = 15;
 const int MSG_MAXLEN = 100;
 
-enum { SRC_WEB = 0, SRC_NOW = 1, SRC_SYS = 2 };
+enum { SRC_WEB = 0, SRC_NOW = 1, SRC_SYS = 2, SRC_MQTT = 3 };
 
 struct MsgEntry {
   String   text;
@@ -555,6 +589,16 @@ void loadSettings() {
 
   wifiSsid = prefs.getString("wssid", "");
   wifiPass = prefs.getString("wpass", "");
+
+  mqttEnabled     = prefs.getBool("mqtt", true);
+  deleteOnReceipt = prefs.getBool("delrx", true);
+  mqttHost = prefs.getString("mhost", MQTT_HOST);
+  mqttPort = prefs.getInt("mport", MQTT_PORT);
+  mqttUser = prefs.getString("muser", MQTT_USER);
+  mqttPass = prefs.getString("mpass", MQTT_PASS);
+  mqttBase = prefs.getString("mbase", MQTT_BASE);
+  mqttPort = constrain(mqttPort, 1, 65535);
+  if (mqttBase.length() == 0) mqttBase = MQTT_BASE;
   // Seed a blank device from secrets.h, if it holds anything real
   if (wifiSsid.length() == 0 && strcmp(WIFI_SSID, "YOUR_WIFI_NAME") != 0) {
     wifiSsid = WIFI_SSID;
@@ -617,6 +661,13 @@ void saveSettings() {
   prefs.putBool("sync",    shareSync);
   prefs.putBool("ota",     otaAuto);
   prefs.putBool("ack",     ackMessages);
+  prefs.putBool("mqtt",    mqttEnabled);
+  prefs.putBool("delrx",   deleteOnReceipt);
+  prefs.putString("mhost", mqttHost);
+  prefs.putInt("mport",    mqttPort);
+  prefs.putString("muser", mqttUser);
+  prefs.putString("mpass", mqttPass);
+  prefs.putString("mbase", mqttBase);
 
   prefs.putUChar("mask", alertMask);
   prefs.putInt("slot",     slotMinutes);
@@ -696,6 +747,22 @@ void deleteMessage(int idx) {
   msgs[msgCount].text = "";
   msgs[msgCount].from = "";
   msgs[msgCount].unread = false;
+}
+
+// A node confirmed it showed this message. Drop it from the queue.
+bool confirmDelivered(uint32_t serial, const String& by) {
+  for (int i = 0; i < msgCount; i++) {
+    if (msgs[i].serial != serial) continue;
+
+    String text = msgs[i].text;
+    String from = msgs[i].from;
+    Serial.printf("RECV from %s: \"%s\" delivered\n", by.c_str(), text.c_str());
+
+    if (deleteOnReceipt) deleteMessage(i);
+    else                 msgs[i].unread = false;
+    return true;
+  }
+  return false;
 }
 
 void markAllRead() {
@@ -1006,6 +1073,113 @@ void maintainData() {
 }
 
 // =====================================================
+// MQTT  (HiveMQ Cloud or any TLS broker)
+// =====================================================
+//  Subscribes to  <base>/msg   - anything published there is queued for
+//                                the nodes, exactly like a panel message
+//  Publishes to   <base>/status - a line when the hub connects
+//                 <base>/ack    - when a node confirms it showed a message
+//
+//  Publishing is optional: if the broker account is subscribe only the
+//  publish quietly fails and everything else keeps working.
+
+String topicMsg()    { return mqttBase + "/msg"; }
+String topicStatus() { return mqttBase + "/status"; }
+String topicAck()    { return mqttBase + "/ack"; }
+
+void mqttPublish(const String& topic, const String& payload) {
+  if (!mqttReady) return;
+  if (mqtt.beginMessage(topic)) {
+    mqtt.print(payload);
+    if (mqtt.endMessage()) { mqttTxCount++; return; }
+  }
+  Serial.println("MQTT publish failed (is this account allowed to publish?)");
+}
+
+void onMqttMessage(int size) {
+  String topic = mqtt.messageTopic();
+
+  String payload;
+  payload.reserve(size + 1);
+  while (mqtt.available()) {
+    char c = (char)mqtt.read();
+    payload += c;
+  }
+  payload.trim();
+
+  mqttRxCount++;
+  Serial.println("MQTT [" + topic + "] " + payload);
+
+  if (payload.length() == 0) return;
+
+  // Everything on the message topic becomes a queued message for the nodes
+  String from = "mqtt";
+  int slash = topic.lastIndexOf('/');
+  if (slash >= 0 && slash + 1 < (int)topic.length()) {
+    String leaf = topic.substring(slash + 1);
+    if (leaf != "msg") from = leaf;            // <base>/msg/kitchen -> "kitchen"
+  }
+  pushMessage(payload, from, SRC_MQTT);
+}
+
+void mqttConnect() {
+  if (!mqttEnabled || mqttHost.length() == 0) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  Serial.println("MQTT connecting to " + mqttHost + ":" + String(mqttPort));
+
+  mqttNet.setInsecure();                       // no cert pinning, same as the HTTPS calls
+  mqtt.setId(("nexus-" + WiFi.macAddress()).c_str());
+  if (mqttUser.length()) mqtt.setUsernamePassword(mqttUser.c_str(), mqttPass.c_str());
+  mqtt.setKeepAliveInterval(60000);
+  mqtt.setConnectionTimeout(8000);
+  mqtt.onMessage(onMqttMessage);
+
+  if (!mqtt.connect(mqttHost.c_str(), mqttPort)) {
+    mqttStatus = "connect failed (" + String(mqtt.connectError()) + ")";
+    Serial.println("MQTT " + mqttStatus);
+    mqttReady = false;
+    return;
+  }
+
+  mqttReady  = true;
+  mqttStatus = "connected";
+  Serial.println("MQTT connected");
+
+  mqtt.subscribe(topicMsg(), 1);
+  mqtt.subscribe(topicMsg() + "/#", 1);        // <base>/msg/anything also works
+  Serial.println("MQTT subscribed to " + topicMsg());
+
+  mqttPublish(topicStatus(), String("{\"hub\":\"") + hubName + "\",\"fw\":\"" + FW_VERSION +
+                             "\",\"ip\":\"" + WiFi.localIP().toString() + "\",\"state\":\"online\"}");
+}
+
+void maintainMqtt() {
+  if (!mqttEnabled) {
+    if (mqttReady) { mqtt.stop(); mqttReady = false; mqttStatus = "turned off"; }
+    return;
+  }
+  if (apMode || WiFi.status() != WL_CONNECTED) return;
+
+  if (mqttReady) {
+    if (!mqtt.connected()) {
+      Serial.println("MQTT lost");
+      mqttReady  = false;
+      mqttStatus = "reconnecting";
+      nextMqttTry = millis() + 5000UL;
+      return;
+    }
+    mqtt.poll();
+    return;
+  }
+
+  if (due(nextMqttTry)) {
+    nextMqttTry = millis() + 15000UL;
+    mqttConnect();
+  }
+}
+
+// =====================================================
 // ESP-NOW HUB
 // =====================================================
 
@@ -1160,6 +1334,7 @@ void deliverMailbox(const uint8_t* mac, int ni) {
   }
 
   if (sent == 0) {
+    // nothing new: the node still gets a line to show
     const char* g = HUB_GREETINGS[random(COUNT(HUB_GREETINGS))];
     Serial.printf("POLL from %s: nothing waiting, said \"%s\"\n", nodes[ni].name, g);
     sendAck(mac, 0, 0, g);
@@ -1278,6 +1453,17 @@ void processEspNow() {
           case PKT_POLL:
             deliverMailbox(item.mac, ni);
             break;
+
+          case PKT_RECV: {
+            // the node showed this message, so it can leave the queue
+            bool found = confirmDelivered(p.seq, from);
+            mqttPublish(topicAck(),
+                        String("{\"node\":\"") + from + "\",\"serial\":" + String(p.seq) +
+                        ",\"delivered\":" + (found ? "true" : "false") +
+                        ",\"queue\":" + String(msgCount) + "}");
+            sendAck(item.mac, p.seq, msgCount, found ? "cleared" : "unknown");
+            break;
+          }
 
           case PKT_TELEM:
             if (!isnan(p.temp) || !isnan(p.hum)) {
@@ -1986,6 +2172,9 @@ void runBootSequence() {
   if (weatherEnabled && wifiOk) {
     nextWxTry = millis() + (fetchWeather() ? WEATHER_OK_MS : WEATHER_RETRY_MS);
   }
+
+  // ---- MQTT (non blocking from here on, first attempt now)
+  if (mqttEnabled && wifiOk) mqttConnect();
 
   // ---- ESP-NOW mesh
   bootRows[4].state = 1;
@@ -3055,6 +3244,20 @@ input[type=checkbox]:checked::after{left:21px}
 </section>
 
 <section>
+  <h2>MQTT</h2>
+  <p class="hint" id="mqnote"></p>
+  <label class="row"><div>Connect to the broker<small>Anything published to the message topic is queued for your nodes</small></div><input type="checkbox" data-k="mqtt"></label>
+  <label class="row"><div>Delete once a node confirms<small>A node says it showed the message, and the hub drops it from the queue</small></div><input type="checkbox" data-k="delrx"></label>
+  <label class="field"><span>Broker host</span><input type="text" data-k="mhost" maxlength="80" placeholder="xxxx.s1.eu.hivemq.cloud"></label>
+  <div class="two">
+    <label class="field"><span>Port</span><input type="number" data-k="mport" min="1" max="65535"></label>
+    <label class="field"><span>Topic prefix</span><input type="text" data-k="mbase" maxlength="24"></label>
+  </div>
+  <label class="field"><span>Username</span><input type="text" data-k="muser" maxlength="40"></label>
+  <label class="field"><span>Password<small style="color:var(--muted)"> (leave blank to keep the saved one)</small></span><input type="password" data-k="mpass" maxlength="60" placeholder="unchanged"></label>
+</section>
+
+<section>
   <h2>Network</h2>
   <p class="hint" id="netnote"></p>
   <div class="btns"><button class="ghost" onclick="forgetWifi()">Change WiFi network</button></div>
@@ -3154,6 +3357,7 @@ async function post(url,data){
 }
 function fill(s){
   document.querySelectorAll('[data-k]').forEach(el=>{
+    if(el.dataset.k==='mpass')return;          // never echo the saved password back
     const v=s[el.dataset.k];if(v===undefined)return;
     if(el.type==='checkbox')el.checked=!!v;else el.value=v;
   });
@@ -3179,6 +3383,7 @@ function render(s){
   ch.push(s.espnow?('mesh on, '+s.nodes.length+' node'+(s.nodes.length==1?'':'s')):'mesh off');
   if(s.temp!==null)ch.push(s.tempDisp+' / '+(s.hum!==null?Math.round(s.hum)+'% RH':'--'));
   ch.push(s.msgCount+' message'+(s.msgCount==1?'':'s'));
+  ch.push(s.mqttReady?'mqtt on':'mqtt off');
   ch.push('fw '+s.fw);
   $('#chips').innerHTML=ch.map(c=>'<span class="chip">'+esc(c)+'</span>').join('');
 
@@ -3200,6 +3405,10 @@ function render(s){
     ?s.nodes.map(n=>'<div class="node"><span>'+esc(n.name)+'<br><small style="color:var(--muted)">'+esc(n.mac)+'</small></span><span>'+esc(n.age)+'<br>'+n.rssi+' dBm, '+n.packets+' pkt</span></div>').join('')
     :'<p class="hint">No node has spoken to the hub yet.</p>';
 
+  $('#mqnote').innerHTML=s.mqttReady
+    ?('Connected. Publish to <b>'+esc(s.mqttTopic)+'</b> and it lands on your nodes. '
+      +s.mqttRx+' in, '+s.mqttTx+' out.')
+    :('Not connected: '+esc(s.mqttStatus)+'. Topic would be <b>'+esc(s.mqttTopic)+'</b>.');
   $('#netnote').innerHTML=s.wifi
     ?('Connected to <b>'+esc(s.ssid)+'</b> at '+esc(s.ip)+', '+s.rssi+' dBm, channel '+s.channel+'.')
     :('Not connected. Saved network: <b>'+esc(s.wifiSsid||'none')+'</b>.');
@@ -3438,6 +3647,11 @@ void handleState() {
   jStr(o, "otaLatest", otaLatest);
   jStr(o, "otaStatus", otaStatus);
   jStr(o, "otaRepo", OTA_REPO);
+  jBool(o, "mqttReady", mqttReady);
+  jStr(o, "mqttStatus", mqttStatus);
+  jStr(o, "mqttTopic", topicMsg());
+  jNum(o, "mqttRx", (long)mqttRxCount);
+  jNum(o, "mqttTx", (long)mqttTxCount);
   jNum(o, "nowRx", (long)nowRxCount);
   jNum(o, "nowTx", (long)nowTxCount);
   jNum(o, "nowDrop", (long)nowDropCount);
@@ -3533,6 +3747,12 @@ void handleState() {
   jBool(o, "sync",    shareSync);
   jBool(o, "ota",     otaAuto);
   jBool(o, "ack",     ackMessages);
+  jBool(o, "mqtt",    mqttEnabled);
+  jBool(o, "delrx",   deleteOnReceipt);
+  jStr(o, "mhost",    mqttHost);
+  jNum(o, "mport",    mqttPort);
+  jStr(o, "muser",    mqttUser);
+  jStr(o, "mbase",    mqttBase);
   jBool(o, "a0", alertMask & 1);
   jBool(o, "a1", alertMask & 2);
   jBool(o, "a2", alertMask & 4);
@@ -3573,6 +3793,32 @@ void handleSettings() {
   shareSync       = argBool("sync",    shareSync);
   otaAuto         = argBool("ota",     otaAuto);
   ackMessages     = argBool("ack",     ackMessages);
+  deleteOnReceipt = argBool("delrx",   deleteOnReceipt);
+
+  {
+    bool wasOn = mqttEnabled;
+    mqttEnabled = argBool("mqtt", mqttEnabled);
+
+    String oldHost = mqttHost, oldUser = mqttUser, oldBase = mqttBase;
+    int    oldPort = mqttPort;
+
+    if (server.hasArg("mhost")) { mqttHost = server.arg("mhost"); mqttHost.trim(); }
+    if (server.hasArg("mbase")) { mqttBase = server.arg("mbase"); mqttBase.trim(); }
+    if (server.hasArg("muser")) { mqttUser = server.arg("muser"); mqttUser.trim(); }
+    // an empty password field means "keep what is stored"
+    if (server.hasArg("mpass") && server.arg("mpass").length()) mqttPass = server.arg("mpass");
+    mqttPort = argInt("mport", mqttPort, 1, 65535);
+    if (mqttBase.length() == 0) mqttBase = MQTT_BASE;
+
+    bool changed = (mqttHost != oldHost) || (mqttUser != oldUser) ||
+                   (mqttBase != oldBase) || (mqttPort != oldPort) ||
+                   (server.hasArg("mpass") && server.arg("mpass").length());
+    if (changed || (mqttEnabled && !wasOn)) {
+      if (mqttReady) { mqtt.stop(); mqttReady = false; }
+      mqttStatus  = "reconnecting";
+      nextMqttTry = 0;
+    }
+  }
 
   bool wasWx = weatherEnabled;
   weatherEnabled = argBool("wx", weatherEnabled);
@@ -3840,6 +4086,7 @@ void loop() {
   maintainTime();
   maintainData();
   maintainEspNow();
+  maintainMqtt();
   maintainOta();
 
   checkPrayerAlerts();

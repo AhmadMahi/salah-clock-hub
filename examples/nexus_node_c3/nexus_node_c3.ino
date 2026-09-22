@@ -61,7 +61,8 @@ enum {
   PKT_SYNC  = 3,   // hub -> nodes: time, prayer times, weather
   PKT_PING  = 4,   // node -> hub: "here is a number, show it and answer me"
   PKT_ACK   = 5,   // hub -> node: the reply to PING, MSG or POLL
-  PKT_POLL  = 6    // node -> hub: "send me anything I have not collected"
+  PKT_POLL  = 6,   // node -> hub: "send me anything I have not collected"
+  PKT_RECV  = 7    // node -> hub: "I showed message <seq>, you can drop it"
 };
 
 struct __attribute__((packed)) NowPacket {
@@ -100,6 +101,11 @@ bool oledOk = false;
 // Seconds of deep sleep between wakes. Set it to 0 to stay awake and repeat
 // on a timer instead, which is handy when you want an unbroken Serial log.
 #define DEEP_SLEEP_SECONDS  15
+
+// The node used to post a "C3 awake" line into the hub's queue on every
+// wake. Real messages now arrive from MQTT, so that is off by default -
+// set it to 1 if you want the node chattering into the queue again.
+#define SEND_TEST_MESSAGE   0
 #define AWAKE_REPEAT_MS     15000
 
 const int  CHANNEL_MIN   = 1;
@@ -124,6 +130,7 @@ char              ackNote[32] = {0};
 volatile int      inboxCount = 0;
 char              inboxFrom[4][16] = {{0}};
 char              inboxText[4][64] = {{0}};
+uint32_t          inboxSerial[4]   = {0};
 uint8_t           hubMac[6]  = {0};
 bool              haveHub    = false;
 
@@ -349,6 +356,7 @@ void onRecv(const uint8_t* mac, const uint8_t* data, int len) {
     if (inboxCount < 4) {                       // keep the first few for the screen
       strncpy(inboxFrom[inboxCount], p.from, sizeof(inboxFrom[0]) - 1);
       strncpy(inboxText[inboxCount], p.text, sizeof(inboxText[0]) - 1);
+      inboxSerial[inboxCount] = p.seq;          // the hub's serial for this one
     }
     inboxCount++;
     Serial.printf("   inbox: [%s] %s\n", p.from, p.text);
@@ -408,6 +416,14 @@ bool doMessage(const char* text) {
   fill(p, PKT_MSG);
   strncpy(p.text, text, sizeof(p.text) - 1);
   return sendAndWait(p, ACK_WAIT_MS, "SEND", "MSG");
+}
+
+// Tells the hub we have shown this message, so it can drop it from the queue
+bool confirmMessage(uint32_t serial) {
+  NowPacket p;
+  fill(p, PKT_RECV);
+  p.seq = serial;
+  return sendAndWait(p, ACK_WAIT_MS);
 }
 
 // Asks the hub for anything this node has not collected yet
@@ -487,6 +503,7 @@ void talkToHub() {
   delay(1600);
 
   // ---- 2. send something for the hub to store
+#if SEND_TEST_MESSAGE
   char line[64];
   snprintf(line, sizeof(line), "C3 awake, wake #%lu", (unsigned long)wakeCount);
   Serial.printf("send  \"%s\" ...\n", line);
@@ -500,6 +517,7 @@ void talkToHub() {
     uiCard("SENT", "----", "no answer", "");
   }
   delay(1600);
+#endif
 
   // ---- 3. collect anything waiting for us
   Serial.println("poll  ...");
@@ -527,6 +545,17 @@ void talkToHub() {
       snprintf(hdr, sizeof(hdr), "FROM %s", inboxFrom[i]);
       uiCard(hdr, big, a1, a2);
       delay(2400);
+
+      // tell the hub we have shown it, so it stops sending it
+      if (confirmMessage(inboxSerial[i])) {
+        Serial.printf("  confirmed serial %lu (%s)\n",
+                      (unsigned long)inboxSerial[i], ackNote);
+        uiCard("RECEIVED", "OK", "hub cleared it", "");
+      } else {
+        Serial.printf("  serial %lu not confirmed\n", (unsigned long)inboxSerial[i]);
+        uiCard("RECEIVED", "OK", "hub did not answer", "");
+      }
+      delay(1200);
     }
   }
 

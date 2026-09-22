@@ -75,7 +75,7 @@ flash the clock updates itself.
 
 **From source**
 
-1. Install the **U8g2** and **ArduinoJson** libraries.
+1. Install the **U8g2**, **ArduinoJson** and **ArduinoMqttClient** libraries.
 2. Optionally copy `secrets.example.h` to `secrets.h` and put your WiFi
    details in it. This only seeds a device that has nothing saved yet, so
    the first boot connects without visiting the setup portal. `secrets.h` is
@@ -145,6 +145,38 @@ the layout.
 The hub sits on your router's WiFi channel and cannot move off it, so every
 node must use that same channel. The panel shows it under **Nodes**, and the
 example node scans for it automatically.
+
+## MQTT
+
+The hub connects to any TLS broker, for example HiveMQ Cloud. Configure it
+under **MQTT** in the web panel, or seed it from `secrets.h` on a fresh board.
+
+| Topic | Direction | What it is |
+| --- | --- | --- |
+| `nexus/msg` | you publish | anything here is queued for your nodes |
+| `nexus/msg/<name>` | you publish | same, and `<name>` shows as the sender |
+| `nexus/status` | hub publishes | a line when the hub comes online |
+| `nexus/ack` | hub publishes | when a node confirms it showed a message |
+
+The prefix (`nexus`) is configurable.
+
+### The full path a message takes
+
+1. You publish `Dinner is ready` to `nexus/msg` from your phone.
+2. The hub receives it and puts it in the queue.
+3. Your node is asleep. Nothing happens, and the message waits.
+4. The node wakes, asks the hub for anything new, and the hub hands it over
+   by ESP-NOW.
+5. The node shows it on its screen, then tells the hub it has been seen.
+6. The hub drops it from the queue and publishes the confirmation to
+   `nexus/ack`.
+
+Nothing is lost while the node sleeps, and nothing is delivered twice.
+Turn off **Delete once a node confirms** if you would rather messages stay
+on the hub's screen after delivery.
+
+Publishing is optional: a subscribe-only broker account still receives
+everything, the `status` and `ack` publishes simply fail quietly.
 
 ## HTTP API
 
