@@ -1,0 +1,11 @@
+# Private WiFi credentials, never commit
+secrets.h
+
+# Build output
+build/
+*.bin
+*.elf
+*.map
+
+# macOS
+.DS_Store
