@@ -97,10 +97,9 @@ const char* NODE_NAME = "c3-test";      // shown next to your messages on the hu
 Adafruit_SSD1306 oled(OLED_W, OLED_H, &Wire, -1);
 bool oledOk = false;
 
-// 0 keeps the node awake and repeats the whole exchange on a timer, which is
-// the easiest way to watch it work in the Serial Monitor. Set it to 30 (or
-// whatever you like) to deep sleep between wakes instead.
-#define DEEP_SLEEP_SECONDS  0
+// Seconds of deep sleep between wakes. Set it to 0 to stay awake and repeat
+// on a timer instead, which is handy when you want an unbroken Serial log.
+#define DEEP_SLEEP_SECONDS  15
 #define AWAKE_REPEAT_MS     15000
 
 const int  CHANNEL_MIN   = 1;
@@ -134,6 +133,15 @@ uint32_t mySeq = 0;
 // ================================================================
 //  DISPLAY
 // ================================================================
+//  Every screen is built from the same centred stack:
+//
+//        TITLE           small, centred            y 2
+//       --------         short rule                y 13
+//        4821            double height, centred    y 21
+//     waiting for hub    small, centred            y 41
+//      matches, good     small, centred            y 52
+//
+//  so the one thing that matters is always in the same place.
 
 void uiBegin() {
 #if HAS_DISPLAY
@@ -159,7 +167,30 @@ void uiSleepDisplay() {
 
 #if HAS_DISPLAY
 
-// One eye. open runs 0 (shut) to 1 (wide), look shifts the pupil.
+// ---- centred text helpers ----
+void ctr(const char* s, int y, int size) {
+  if (!s || !s[0]) return;
+  int w = (int)strlen(s) * 6 * size;
+  int x = (OLED_W - w) / 2;
+  if (x < 0) x = 0;
+  oled.setTextSize(size);
+  oled.setCursor(x, y);
+  oled.print(s);
+}
+
+// The headline. Double height when it fits, otherwise it quietly drops to
+// single height rather than running off both edges.
+void ctrBig(const char* s, int y) {
+  if (!s || !s[0]) return;
+  if ((int)strlen(s) * 12 <= OLED_W - 4) ctr(s, y, 2);
+  else                                   ctr(s, y + 4, 1);
+}
+
+void rule(int y, int w) {
+  oled.drawFastHLine((OLED_W - w) / 2, y, w, SSD1306_WHITE);
+}
+
+// ---- eyes ----
 void drawEye(int cx, int cy, float open, int look) {
   const int EW = 34, EH = 30;
   int h = (int)(EH * open);
@@ -188,8 +219,7 @@ void uiEyes(float open, int look) {
 void uiEyesOpen() {
   for (int i = 0; i <= 14; i++) {
     float p = i / 14.0f;
-    float e = 1.0f - (1.0f - p) * (1.0f - p);   // ease out
-    uiEyes(e, 0);
+    uiEyes(1.0f - (1.0f - p) * (1.0f - p), 0);  // ease out
     delay(22);
   }
   for (int i = 0; i < 12; i++) {                // a quick look around
@@ -206,61 +236,72 @@ void uiEyesClose() {
   delay(120);
 }
 
-// Header, rule, then up to three body lines. The first body line is
-// double height so the number or word you care about reads at a glance.
-void uiCard(const char* title, const char* big, const char* l2, const char* l3) {
-  oled.clearDisplay();
-
-  oled.setTextColor(SSD1306_WHITE);
-  oled.setTextSize(1);
-  oled.setCursor(2, 2);
-  oled.print(title);
-  oled.drawFastHLine(0, 12, OLED_W, SSD1306_WHITE);
-
-  if (big && big[0]) {
-    oled.setTextSize(2);
-    int w = strlen(big) * 12;
-    oled.setCursor(w < OLED_W ? (OLED_W - w) / 2 : 0, 20);
-    oled.print(big);
+// ---- the broadcast mark: a core with rings travelling outward ----
+void drawBeacon(int cx, int cy, int phase) {
+  oled.fillCircle(cx, cy, 3, SSD1306_WHITE);
+  for (int i = 0; i < 3; i++) {
+    if (i <= phase % 4) oled.drawCircle(cx, cy, 7 + i * 5, SSD1306_WHITE);
   }
-  oled.setTextSize(1);
-  if (l2 && l2[0]) { oled.setCursor(2, 42); oled.print(l2); }
-  if (l3 && l3[0]) { oled.setCursor(2, 54); oled.print(l3); }
+}
 
+// Wake-up mark: the beacon pulsing with the node's name under it
+void uiHello(const char* name) {
+  for (int f = 0; f < 10; f++) {
+    oled.clearDisplay();
+    oled.setTextColor(SSD1306_WHITE);
+    drawBeacon(OLED_W / 2, 26, f);
+    ctr(name, 50, 1);
+    oled.display();
+    delay(90);
+  }
+}
+
+// Scanning / waiting screen: title, beacon, one note under it
+void uiBeacon(const char* title, const char* note, int phase) {
+  oled.clearDisplay();
+  oled.setTextColor(SSD1306_WHITE);
+  ctr(title, 2, 1);
+  rule(13, 70);
+  drawBeacon(OLED_W / 2, 32, phase);
+  ctr(note, 52, 1);
   oled.display();
 }
 
-// The same card with a row of dots that fills while we wait
+// The standard result card, everything centred
+void uiCard(const char* title, const char* big, const char* l2, const char* l3) {
+  oled.clearDisplay();
+  oled.setTextColor(SSD1306_WHITE);
+  ctr(title, 2, 1);
+  rule(13, 70);
+  ctrBig(big, 21);
+  ctr(l2, 41, 1);
+  ctr(l3, 52, 1);
+  oled.display();
+}
+
+// The same card, with dots filling while we wait for the hub
 void uiCardWaiting(const char* title, const char* big, const char* note, int phase) {
   oled.clearDisplay();
-
   oled.setTextColor(SSD1306_WHITE);
-  oled.setTextSize(1);
-  oled.setCursor(2, 2);
-  oled.print(title);
-  oled.drawFastHLine(0, 12, OLED_W, SSD1306_WHITE);
-
-  if (big && big[0]) {
-    oled.setTextSize(2);
-    int w = strlen(big) * 12;
-    oled.setCursor(w < OLED_W ? (OLED_W - w) / 2 : 0, 20);
-    oled.print(big);
-  }
-  oled.setTextSize(1);
-  if (note && note[0]) { oled.setCursor(2, 42); oled.print(note); }
+  ctr(title, 2, 1);
+  rule(13, 70);
+  ctrBig(big, 21);
+  ctr(note, 41, 1);
 
   for (int i = 0; i < 5; i++) {
     int x = OLED_W / 2 - 22 + i * 11;
-    if (i <= phase % 6) oled.fillCircle(x, 58, 2, SSD1306_WHITE);
-    else                oled.drawPixel(x, 58, SSD1306_WHITE);
+    if (i <= phase % 6) oled.fillCircle(x, 56, 2, SSD1306_WHITE);
+    else                oled.drawCircle(x, 56, 2, SSD1306_WHITE);
   }
   oled.display();
 }
 
-#else   // no display: the card calls become no-ops
+#else   // no display: the calls become no-ops
 
 void uiEyesOpen() {}
 void uiEyesClose() {}
+void uiHello(const char*) {}
+void uiBeacon(const char*, const char*, int) {}
 void uiCard(const char*, const char*, const char*, const char*) {}
 void uiCardWaiting(const char*, const char*, const char*, int) {}
 
@@ -387,18 +428,19 @@ int doPoll() {
 // Tries the remembered channel first, then sweeps. Returns the channel or 0.
 int findHub() {
   char note[24];
+  int phase = 0;
 
   if (savedChannel >= CHANNEL_MIN && savedChannel <= CHANNEL_MAX) {
     snprintf(note, sizeof(note), "channel %d", savedChannel);
-    uiCard("LINK", "HUB?", note, "");
+    uiBeacon("LOOKING FOR HUB", note, phase++);
     setChannel(savedChannel);
     if (doPing(esp_random(), ACK_WAIT_MS)) return savedChannel;
     Serial.printf("channel %d went quiet, scanning...\n", savedChannel);
   }
 
   for (int ch = CHANNEL_MIN; ch <= CHANNEL_MAX; ch++) {
-    snprintf(note, sizeof(note), "scanning channel %d", ch);
-    uiCard("LINK", "HUB?", note, "");
+    snprintf(note, sizeof(note), "channel %d", ch);
+    uiBeacon("SCANNING", note, phase++);
     setChannel(ch);
     if (doPing(esp_random(), 120)) {
       Serial.printf("found the hub on channel %d\n", ch);
@@ -411,22 +453,22 @@ int findHub() {
 // ---------------- one full visit ----------------
 
 void talkToHub() {
-  char big[20], l2[28], l3[28];
+  char big[20], l2[24], l3[24];
 
   int ch = findHub();
   if (ch == 0) {
     Serial.println("no answer on any channel.");
     Serial.println("  - is the hub powered up and joined to WiFi?");
     Serial.println("  - ESP-NOW only starts once the hub is on the network");
-    uiCard("LINK", "NO HUB", "is it on WiFi?", "retrying next wake");
-    delay(2000);
+    uiCard("NO HUB", "----", "is it on WiFi?", "trying again later");
+    delay(2200);
     savedChannel = 0;
     return;
   }
   savedChannel = ch;
-  snprintf(l2, sizeof(l2), "hub on channel %d", ch);
-  uiCard("LINK", "FOUND", l2, "");
-  delay(700);
+  snprintf(l2, sizeof(l2), "channel %d", ch);
+  uiCard("LINKED", "HUB", l2, "");
+  delay(800);
 
   // ---- 1. ping with a random number
   uint32_t n = esp_random() % 9000 + 1000;       // a readable 4 digit number
@@ -437,12 +479,12 @@ void talkToHub() {
                   (unsigned long)ackSeq, (unsigned long)(n + 1), ok ? "OK" : "MISMATCH");
     snprintf(big, sizeof(big), "%lu", (unsigned long)ackSeq);
     snprintf(l2,  sizeof(l2),  "sent %lu", (unsigned long)n);
-    uiCard("REPLY", big, l2, ok ? "matches, link good" : "MISMATCH");
+    uiCard("REPLY", big, l2, ok ? "link is good" : "MISMATCH");
   } else {
     Serial.println("  no reply");
     uiCard("REPLY", "----", "no answer", "");
   }
-  delay(1400);
+  delay(1600);
 
   // ---- 2. send something for the hub to store
   char line[64];
@@ -457,7 +499,7 @@ void talkToHub() {
     Serial.println("  no reply");
     uiCard("SENT", "----", "no answer", "");
   }
-  delay(1400);
+  delay(1600);
 
   // ---- 3. collect anything waiting for us
   Serial.println("poll  ...");
@@ -466,24 +508,25 @@ void talkToHub() {
   if (got < 0) {
     Serial.println("  no reply");
     uiCard("INBOX", "----", "no answer", "");
-    delay(1600);
+    delay(1800);
   } else if (got == 0) {
-    Serial.println("  nothing waiting");
-    uiCard("INBOX", "EMPTY", "nothing waiting", "");
-    delay(1600);
+    // nothing queued, but the hub still says something back
+    Serial.printf("  nothing waiting, hub says \"%s\"\n", ackNote);
+    uiCard("HUB SAYS", ackNote[0] ? ackNote : "hey", "no messages waiting", "");
+    delay(2200);
   } else {
     Serial.printf("  received %d message(s)\n", got);
     int show = min(got, 4);
     for (int i = 0; i < show; i++) {
       snprintf(big, sizeof(big), "%d/%d", i + 1, got);
-      // the text is split over the two small lines so longer notes still fit
-      char a[22] = {0}, b[22] = {0};
-      strncpy(a, inboxText[i], 21);
-      if (strlen(inboxText[i]) > 21) strncpy(b, inboxText[i] + 21, 21);
+      // split the text over the two small lines so longer notes still fit
+      char a1[22] = {0}, a2[22] = {0};
+      strncpy(a1, inboxText[i], 21);
+      if (strlen(inboxText[i]) > 21) strncpy(a2, inboxText[i] + 21, 21);
       char hdr[22];
-      snprintf(hdr, sizeof(hdr), "INBOX %s", inboxFrom[i]);
-      uiCard(hdr, big, a, b);
-      delay(2200);
+      snprintf(hdr, sizeof(hdr), "FROM %s", inboxFrom[i]);
+      uiCard(hdr, big, a1, a2);
+      delay(2400);
     }
   }
 
@@ -502,6 +545,7 @@ void setup() {
 
   uiBegin();
   uiEyesOpen();                         // good morning
+  uiHello(NODE_NAME);                   // beacon mark + who we are
 
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();                    // ESP-NOW only, never join a network
@@ -538,6 +582,7 @@ void loop() {
     wakeCount++;
     Serial.printf("\n--- round %lu ---\n", (unsigned long)wakeCount);
     uiEyesOpen();
+    uiHello(NODE_NAME);
     talkToHub();
     uiEyesClose();
   }

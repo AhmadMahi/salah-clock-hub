@@ -99,7 +99,7 @@ const char* HOSTNAME = "salah-clock";           // -> http://salah-clock.local
 #define DEVICE_NAME    "NEXUS"
 #define DEVICE_TAGLINE "MASTER HUB"
 
-#define FW_VERSION "3.4.0"
+#define FW_VERSION "3.5.0"
 #define OTA_REPO   "AhmadMahi/salah-clock-hub"
 #define OTA_ASSET  "salah_clock_hub.bin"
 
@@ -1131,6 +1131,13 @@ void sendAck(const uint8_t* mac, uint32_t seq, int count, const char* note) {
   nowSendTo(mac, p);
 }
 
+// When a node polls and the queue is empty, the hub still answers with
+// something, so the node always has a line to show.
+const char* HUB_GREETINGS[] = {
+  "hey", "all quiet", "nothing new", "hub is up",
+  "standing by", "all good here", "still awake", "salam"
+};
+
 // A node asked for whatever it has not collected yet
 void deliverMailbox(const uint8_t* mac, int ni) {
   const int MAX_PER_POLL = 5;
@@ -1152,8 +1159,14 @@ void deliverMailbox(const uint8_t* mac, int ni) {
     delay(10);                            // let the node's receive queue keep up
   }
 
-  Serial.printf("POLL from %s: sent %d\n", nodes[ni].name, sent);
-  sendAck(mac, 0, sent, "delivered");
+  if (sent == 0) {
+    const char* g = HUB_GREETINGS[random(COUNT(HUB_GREETINGS))];
+    Serial.printf("POLL from %s: nothing waiting, said \"%s\"\n", nodes[ni].name, g);
+    sendAck(mac, 0, 0, g);
+  } else {
+    Serial.printf("POLL from %s: sent %d\n", nodes[ni].name, sent);
+    sendAck(mac, 0, sent, "delivered");
+  }
 }
 
 // Time + prayer times + weather, so every node can show the same data

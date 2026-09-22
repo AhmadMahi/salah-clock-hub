@@ -53,7 +53,10 @@ enum {
                       POLL
            prayer[1]  how many messages the hub holds in total
            epoch      unix time, or 0 if the hub has no time yet
-           text       a short word: "pong", "stored" or "delivered"
+           text       a short word: "pong", "stored" or "delivered".
+                      After a POLL that found nothing, this is a short
+                      greeting instead, so the node always has a line
+                      to show.
 */
 
 struct __attribute__((packed)) NowPacket {
