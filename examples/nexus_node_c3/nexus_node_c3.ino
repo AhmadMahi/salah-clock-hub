@@ -1,18 +1,29 @@
 /*
   ================================================================
-   NEXUS NODE  -  ESP32-C3 over ESP-NOW only
+   NEXUS NODE  -  ESP32-C3 + 0.96" OLED, over ESP-NOW only
   ================================================================
-   This node never joins WiFi. It wakes, talks to the hub, and goes
-   back to sleep.
+   This node never joins WiFi. It wakes, shows what it is doing on
+   its own little screen, talks to the hub, and goes back to sleep.
 
-   Each wake it does three things:
-     1. PING   sends a random number. The hub shows it on its screen
+   EACH WAKE
+     1. eyes blink open
+     2. PING   sends a random number. The hub shows it on its screen
                and answers with that number + 1.
-     2. MSG    sends a line of text, which the hub stores in its
+     3. MSG    sends a line of text, which the hub stores in its
                15 slot queue.
-     3. POLL   asks for anything waiting for this node, for example a
-               message you typed on your phone. The hub replies with
-               each one, then says how many it sent.
+     4. POLL   asks for anything waiting for this node, for example a
+               message you typed on your phone.
+     5. holds the result for a moment, eyes close, deep sleep.
+
+   WIRING   0.96" SSD1306, I2C address 0x3C
+     SDA -> GPIO 8
+     SCL -> GPIO 9
+     VCC -> 3V3
+     GND -> GND
+
+   LIBRARIES (Library Manager)
+     Adafruit GFX Library
+     Adafruit SSD1306
 
    THE CHANNEL
    The hub sits on your router's WiFi channel and cannot move off it.
@@ -24,9 +35,7 @@
 
    SETUP
      Board: any ESP32-C3 board (ESP32 Arduino core 2.x or 3.x)
-     This is a single file. Nothing else to copy, no libraries to
-     install beyond the ESP32 core itself. Paste it into a new sketch
-     and upload.
+     This is a single file. Paste it into a new sketch and upload.
   ================================================================
 */
 
@@ -34,6 +43,9 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
 // ================================================================
 //  PACKET FORMAT  -  must stay byte for byte identical to
@@ -74,6 +86,17 @@ static_assert(sizeof(NowPacket) == 148, "NowPacket layout changed - update both 
 
 const char* NODE_NAME = "c3-test";      // shown next to your messages on the hub
 
+// ---- display ----
+#define HAS_DISPLAY   1                 // set to 0 to run without a screen
+#define OLED_SDA      8
+#define OLED_SCL      9
+#define OLED_ADDR     0x3C
+#define OLED_W        128
+#define OLED_H        64
+
+Adafruit_SSD1306 oled(OLED_W, OLED_H, &Wire, -1);
+bool oledOk = false;
+
 // 0 keeps the node awake and repeats the whole exchange on a timer, which is
 // the easiest way to watch it work in the Serial Monitor. Set it to 30 (or
 // whatever you like) to deep sleep between wakes instead.
@@ -100,10 +123,148 @@ volatile uint32_t ackEpoch   = 0;
 char              ackNote[32] = {0};
 
 volatile int      inboxCount = 0;
+char              inboxFrom[4][16] = {{0}};
+char              inboxText[4][64] = {{0}};
 uint8_t           hubMac[6]  = {0};
 bool              haveHub    = false;
 
 uint32_t mySeq = 0;
+
+
+// ================================================================
+//  DISPLAY
+// ================================================================
+
+void uiBegin() {
+#if HAS_DISPLAY
+  Wire.begin(OLED_SDA, OLED_SCL);
+  // the last argument keeps Adafruit from calling Wire.begin() again with
+  // the default pins, which would undo the line above
+  oledOk = oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR, true, false);
+  if (!oledOk) { Serial.println("no OLED at 0x3C"); return; }
+  oled.setTextWrap(false);              // long lines clip instead of reflowing
+  oled.clearDisplay();
+  oled.display();
+#endif
+}
+
+void uiSleepDisplay() {
+#if HAS_DISPLAY
+  if (!oledOk) return;
+  oled.clearDisplay();
+  oled.display();
+  oled.ssd1306_command(SSD1306_DISPLAYOFF);   // dark while we sleep
+#endif
+}
+
+#if HAS_DISPLAY
+
+// One eye. open runs 0 (shut) to 1 (wide), look shifts the pupil.
+void drawEye(int cx, int cy, float open, int look) {
+  const int EW = 34, EH = 30;
+  int h = (int)(EH * open);
+
+  if (h < 4) {                                  // a closed eye is just a line
+    oled.fillRoundRect(cx - EW / 2, cy - 1, EW, 3, 1, SSD1306_WHITE);
+    return;
+  }
+
+  int r = min(10, h / 2);
+  oled.fillRoundRect(cx - EW / 2, cy - h / 2, EW, h, r, SSD1306_WHITE);
+
+  if (h >= 16) {                                // pupil, once there is room
+    oled.fillCircle(cx + look, cy, 6, SSD1306_BLACK);
+    oled.fillCircle(cx + look - 2, cy - 2, 1, SSD1306_WHITE);
+  }
+}
+
+void uiEyes(float open, int look) {
+  oled.clearDisplay();
+  drawEye(38, 32, open, look);
+  drawEye(90, 32, open, look);
+  oled.display();
+}
+
+void uiEyesOpen() {
+  for (int i = 0; i <= 14; i++) {
+    float p = i / 14.0f;
+    float e = 1.0f - (1.0f - p) * (1.0f - p);   // ease out
+    uiEyes(e, 0);
+    delay(22);
+  }
+  for (int i = 0; i < 12; i++) {                // a quick look around
+    uiEyes(1.0f, (int)(7 * sinf(i / 11.0f * 6.2832f)));
+    delay(35);
+  }
+}
+
+void uiEyesClose() {
+  for (int i = 14; i >= 0; i--) {
+    uiEyes(i / 14.0f, 0);
+    delay(22);
+  }
+  delay(120);
+}
+
+// Header, rule, then up to three body lines. The first body line is
+// double height so the number or word you care about reads at a glance.
+void uiCard(const char* title, const char* big, const char* l2, const char* l3) {
+  oled.clearDisplay();
+
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setTextSize(1);
+  oled.setCursor(2, 2);
+  oled.print(title);
+  oled.drawFastHLine(0, 12, OLED_W, SSD1306_WHITE);
+
+  if (big && big[0]) {
+    oled.setTextSize(2);
+    int w = strlen(big) * 12;
+    oled.setCursor(w < OLED_W ? (OLED_W - w) / 2 : 0, 20);
+    oled.print(big);
+  }
+  oled.setTextSize(1);
+  if (l2 && l2[0]) { oled.setCursor(2, 42); oled.print(l2); }
+  if (l3 && l3[0]) { oled.setCursor(2, 54); oled.print(l3); }
+
+  oled.display();
+}
+
+// The same card with a row of dots that fills while we wait
+void uiCardWaiting(const char* title, const char* big, const char* note, int phase) {
+  oled.clearDisplay();
+
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setTextSize(1);
+  oled.setCursor(2, 2);
+  oled.print(title);
+  oled.drawFastHLine(0, 12, OLED_W, SSD1306_WHITE);
+
+  if (big && big[0]) {
+    oled.setTextSize(2);
+    int w = strlen(big) * 12;
+    oled.setCursor(w < OLED_W ? (OLED_W - w) / 2 : 0, 20);
+    oled.print(big);
+  }
+  oled.setTextSize(1);
+  if (note && note[0]) { oled.setCursor(2, 42); oled.print(note); }
+
+  for (int i = 0; i < 5; i++) {
+    int x = OLED_W / 2 - 22 + i * 11;
+    if (i <= phase % 6) oled.fillCircle(x, 58, 2, SSD1306_WHITE);
+    else                oled.drawPixel(x, 58, SSD1306_WHITE);
+  }
+  oled.display();
+}
+
+#else   // no display: the card calls become no-ops
+
+void uiEyesOpen() {}
+void uiEyesClose() {}
+void uiCard(const char*, const char*, const char*, const char*) {}
+void uiCardWaiting(const char*, const char*, const char*, int) {}
+
+#endif
 
 // ---------------- plumbing ----------------
 
@@ -144,6 +305,10 @@ void onRecv(const uint8_t* mac, const uint8_t* data, int len) {
     strncpy(ackNote, p.text, sizeof(ackNote) - 1);
     gotAck   = true;
   } else if (p.type == PKT_MSG) {
+    if (inboxCount < 4) {                       // keep the first few for the screen
+      strncpy(inboxFrom[inboxCount], p.from, sizeof(inboxFrom[0]) - 1);
+      strncpy(inboxText[inboxCount], p.text, sizeof(inboxText[0]) - 1);
+    }
     inboxCount++;
     Serial.printf("   inbox: [%s] %s\n", p.from, p.text);
   } else if (p.type == PKT_SYNC) {
@@ -167,30 +332,41 @@ void setChannel(int ch) {
   delay(5);
 }
 
+// Spins the waiting dots until the flag comes up or we run out of time
+bool waitForAck(int waitMs, const char* title, const char* big) {
+  unsigned long t0 = millis();
+  int phase = 0;
+  while (!gotAck && millis() - t0 < (unsigned long)waitMs) {
+    if (title) uiCardWaiting(title, big, "waiting for the hub", phase++);
+    delay(title ? 60 : 2);
+  }
+  return gotAck;
+}
+
 // Sends one packet and waits for the hub's reply
-bool sendAndWait(NowPacket& p, int waitMs) {
+bool sendAndWait(NowPacket& p, int waitMs, const char* title = nullptr,
+                 const char* big = nullptr) {
   gotAck = false;
   if (esp_now_send(BROADCAST, (uint8_t*)&p, sizeof(p)) != ESP_OK) return false;
-
-  unsigned long t0 = millis();
-  while (!gotAck && millis() - t0 < (unsigned long)waitMs) delay(2);
-  return gotAck;
+  return waitForAck(waitMs, title, big);
 }
 
 // ---------------- the three exchanges ----------------
 
-bool doPing(uint32_t number, int waitMs) {
+bool doPing(uint32_t number, int waitMs, bool show = false) {
   NowPacket p;
   fill(p, PKT_PING);
   p.seq = number;                       // the hub echoes number + 1
-  return sendAndWait(p, waitMs);
+  char num[16];
+  snprintf(num, sizeof(num), "%lu", (unsigned long)number);
+  return sendAndWait(p, waitMs, show ? "PING" : nullptr, show ? num : nullptr);
 }
 
 bool doMessage(const char* text) {
   NowPacket p;
   fill(p, PKT_MSG);
   strncpy(p.text, text, sizeof(p.text) - 1);
-  return sendAndWait(p, ACK_WAIT_MS);
+  return sendAndWait(p, ACK_WAIT_MS, "SEND", "MSG");
 }
 
 // Asks the hub for anything this node has not collected yet
@@ -203,21 +379,26 @@ int doPoll() {
   esp_now_send(BROADCAST, (uint8_t*)&p, sizeof(p));
 
   // messages arrive first, then the ack telling us how many there were
-  unsigned long t0 = millis();
-  while (!gotAck && millis() - t0 < (unsigned long)MAILBOX_WAIT) delay(2);
+  waitForAck(MAILBOX_WAIT, "INBOX", "ASK");
 
   return gotAck ? ackCount : -1;
 }
 
 // Tries the remembered channel first, then sweeps. Returns the channel or 0.
 int findHub() {
+  char note[24];
+
   if (savedChannel >= CHANNEL_MIN && savedChannel <= CHANNEL_MAX) {
+    snprintf(note, sizeof(note), "channel %d", savedChannel);
+    uiCard("LINK", "HUB?", note, "");
     setChannel(savedChannel);
     if (doPing(esp_random(), ACK_WAIT_MS)) return savedChannel;
     Serial.printf("channel %d went quiet, scanning...\n", savedChannel);
   }
 
   for (int ch = CHANNEL_MIN; ch <= CHANNEL_MAX; ch++) {
+    snprintf(note, sizeof(note), "scanning channel %d", ch);
+    uiCard("LINK", "HUB?", note, "");
     setChannel(ch);
     if (doPing(esp_random(), 120)) {
       Serial.printf("found the hub on channel %d\n", ch);
@@ -230,40 +411,84 @@ int findHub() {
 // ---------------- one full visit ----------------
 
 void talkToHub() {
+  char big[20], l2[28], l3[28];
+
   int ch = findHub();
   if (ch == 0) {
     Serial.println("no answer on any channel.");
     Serial.println("  - is the hub powered up and joined to WiFi?");
     Serial.println("  - ESP-NOW only starts once the hub is on the network");
+    uiCard("LINK", "NO HUB", "is it on WiFi?", "retrying next wake");
+    delay(2000);
     savedChannel = 0;
     return;
   }
   savedChannel = ch;
+  snprintf(l2, sizeof(l2), "hub on channel %d", ch);
+  uiCard("LINK", "FOUND", l2, "");
+  delay(700);
 
-  // 1. ping with a random number
-  uint32_t n = esp_random() % 9000 + 1000;     // a readable 4 digit number
+  // ---- 1. ping with a random number
+  uint32_t n = esp_random() % 9000 + 1000;       // a readable 4 digit number
   Serial.printf("ping  %lu ...\n", (unsigned long)n);
-  if (doPing(n, ACK_WAIT_MS)) {
+  if (doPing(n, ACK_WAIT_MS, true)) {
+    bool ok = (ackSeq == n + 1);
     Serial.printf("  hub replied %lu  (expected %lu)  %s\n",
-                  (unsigned long)ackSeq, (unsigned long)(n + 1),
-                  ackSeq == n + 1 ? "OK" : "MISMATCH");
+                  (unsigned long)ackSeq, (unsigned long)(n + 1), ok ? "OK" : "MISMATCH");
+    snprintf(big, sizeof(big), "%lu", (unsigned long)ackSeq);
+    snprintf(l2,  sizeof(l2),  "sent %lu", (unsigned long)n);
+    uiCard("REPLY", big, l2, ok ? "matches, link good" : "MISMATCH");
   } else {
     Serial.println("  no reply");
+    uiCard("REPLY", "----", "no answer", "");
   }
+  delay(1400);
 
-  // 2. send something for the hub to store
+  // ---- 2. send something for the hub to store
   char line[64];
   snprintf(line, sizeof(line), "C3 awake, wake #%lu", (unsigned long)wakeCount);
   Serial.printf("send  \"%s\" ...\n", line);
-  if (doMessage(line)) Serial.printf("  hub says %s, holding %d\n", ackNote, ackTotal);
-  else                 Serial.println("  no reply");
+  if (doMessage(line)) {
+    Serial.printf("  hub says %s, holding %d\n", ackNote, ackTotal);
+    snprintf(l2, sizeof(l2), "hub says %s", ackNote);
+    snprintf(l3, sizeof(l3), "queue holds %d", ackTotal);
+    uiCard("SENT", "OK", l2, l3);
+  } else {
+    Serial.println("  no reply");
+    uiCard("SENT", "----", "no answer", "");
+  }
+  delay(1400);
 
-  // 3. collect anything waiting for us
+  // ---- 3. collect anything waiting for us
   Serial.println("poll  ...");
   int got = doPoll();
-  if (got < 0)      Serial.println("  no reply");
-  else if (got == 0) Serial.println("  nothing waiting");
-  else               Serial.printf("  received %d message(s)\n", got);
+
+  if (got < 0) {
+    Serial.println("  no reply");
+    uiCard("INBOX", "----", "no answer", "");
+    delay(1600);
+  } else if (got == 0) {
+    Serial.println("  nothing waiting");
+    uiCard("INBOX", "EMPTY", "nothing waiting", "");
+    delay(1600);
+  } else {
+    Serial.printf("  received %d message(s)\n", got);
+    int show = min(got, 4);
+    for (int i = 0; i < show; i++) {
+      snprintf(big, sizeof(big), "%d/%d", i + 1, got);
+      // the text is split over the two small lines so longer notes still fit
+      char a[22] = {0}, b[22] = {0};
+      strncpy(a, inboxText[i], 21);
+      if (strlen(inboxText[i]) > 21) strncpy(b, inboxText[i] + 21, 21);
+      char hdr[22];
+      snprintf(hdr, sizeof(hdr), "INBOX %s", inboxFrom[i]);
+      uiCard(hdr, big, a, b);
+      delay(2200);
+    }
+  }
+
+  // ---- hold the last screen for a moment before the eyes close
+  delay(2000);
 }
 
 // ---------------- setup / loop ----------------
@@ -275,12 +500,16 @@ void setup() {
 
   Serial.printf("\n=== NEXUS node %s, wake #%lu ===\n", NODE_NAME, (unsigned long)wakeCount);
 
+  uiBegin();
+  uiEyesOpen();                         // good morning
+
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();                    // ESP-NOW only, never join a network
   esp_wifi_set_ps(WIFI_PS_NONE);        // power save would drop replies
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW init failed");
+    uiCard("ERROR", "ESPNOW", "init failed", "");
     return;
   }
   esp_now_register_recv_cb(onRecv);
@@ -290,9 +519,12 @@ void setup() {
 
   talkToHub();
 
+  uiEyesClose();                        // good night
+
 #if DEEP_SLEEP_SECONDS > 0
   Serial.printf("sleeping %d s\n\n", DEEP_SLEEP_SECONDS);
   Serial.flush();
+  uiSleepDisplay();
   esp_sleep_enable_timer_wakeup((uint64_t)DEEP_SLEEP_SECONDS * 1000000ULL);
   esp_deep_sleep_start();
 #endif
@@ -305,7 +537,9 @@ void loop() {
     last = millis();
     wakeCount++;
     Serial.printf("\n--- round %lu ---\n", (unsigned long)wakeCount);
+    uiEyesOpen();
     talkToHub();
+    uiEyesClose();
   }
   delay(20);
 #endif

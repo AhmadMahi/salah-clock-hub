@@ -132,11 +132,12 @@ a pixel ruler, then adjust until every line is sharp.
 ## ESP-NOW nodes
 
 [`examples/nexus_node_c3/nexus_node_c3.ino`](examples/nexus_node_c3/nexus_node_c3.ino)
-is a complete ESP32-C3 node that never joins WiFi, in a single file with no
-extra downloads:
-it wakes, pings the hub with a random number (which the hub shows on screen
-and answers with number plus one), sends a message for the queue, collects
-anything waiting for it, and sleeps. It finds the hub's channel by itself.
+is a complete ESP32-C3 node with its own 0.96" OLED (SDA 8, SCL 9, `0x3C`),
+in a single file with the packet format built in. It never joins WiFi:
+it opens its eyes, pings the hub with a random number (which the hub shows on
+its screen and answers with number plus one), sends a message for the queue,
+collects anything waiting for it, shows each step on its own display, then
+closes its eyes and sleeps. It finds the hub's channel by itself.
 
 See [NODE_EXAMPLE.md](NODE_EXAMPLE.md) for that sketch and the packet format. Copy `espnow_packet.h` to each node so both sides agree on
 the layout.

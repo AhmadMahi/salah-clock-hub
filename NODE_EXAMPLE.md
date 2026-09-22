@@ -7,16 +7,33 @@ sync packet back out to all of them.
 ## Ready-made node sketch
 
 [`examples/nexus_node_c3/nexus_node_c3.ino`](examples/nexus_node_c3/nexus_node_c3.ino)
-is a complete ESP32-C3 node that never joins WiFi. It is a **single file** with
-the packet format built in, so there is nothing else to copy and no library to
-install beyond the ESP32 core. Paste it into a new sketch, set `NODE_NAME`, and
-upload. Each wake it:
+is a complete ESP32-C3 node that never joins WiFi, with its own 0.96" OLED.
+It is a **single file** with the packet format built in, so there is nothing
+else to copy. Paste it into a new sketch, set `NODE_NAME`, and upload.
 
-1. **pings** the hub with a random number. The hub shows that number on its
+Wiring, and the libraries it needs:
+
+| | |
+| --- | --- |
+| Display | 0.96" SSD1306, I2C, address `0x3C` |
+| SDA | GPIO 8 |
+| SCL | GPIO 9 |
+| Libraries | Adafruit GFX Library, Adafruit SSD1306 |
+
+Set `HAS_DISPLAY` to `0` to run it with no screen at all.
+
+Each wake it:
+
+1. blinks its **eyes open**
+2. **pings** the hub with a random number. The hub shows that number on its
    display and answers with the number plus one.
-2. **sends** a line of text, which the hub stores in its 15 slot queue.
-3. **polls** for anything waiting for it, such as a message you typed on your
-   phone, and the hub hands those over.
+3. **sends** a line of text, which the hub stores in its 15 slot queue.
+4. **polls** for anything waiting for it, such as a message you typed on your
+   phone, and shows each one it receives.
+5. holds the last screen, **closes its eyes**, and sleeps.
+
+Every step is narrated on the node's own screen: what it is sending, a row of
+dots while it waits, and what came back.
 
 It finds the hub's channel by itself on the first wake and remembers it in
 RTC memory, so later wakes are immediate.
