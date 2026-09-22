@@ -40,6 +40,32 @@ read the morning or evening duas.
 | SDA | GPIO 21 |
 | SCL | GPIO 22 |
 
+## First run and WiFi
+
+On boot the hub joins the network saved in its flash. If it cannot connect,
+or nothing is saved yet, it opens its own setup access point and shows this
+on the display:
+
+```
+            WIFI SETUP
+ ------------------------------
+ JOIN   NEXUS-A1B2
+ PASS   nexus1234
+ OPEN   192.168.4.1
+```
+
+Join that network from a phone, and the setup page opens by itself (it is a
+captive portal). Pick your network from the scanned list, enter the password,
+and the hub saves it and restarts.
+
+Credentials live in flash, not in the firmware, so **they survive every
+update**. While the portal is open the hub also retries the saved network
+every two minutes, so a router reboot heals itself without you touching
+anything.
+
+To move the hub to a different network later, use **Change WiFi network**
+under **Network** in the web panel.
+
 ## Flashing
 
 **From a release (easiest)** — download `salah_clock_hub.bin` from
@@ -50,8 +76,11 @@ flash the clock updates itself.
 **From source**
 
 1. Install the **U8g2** and **ArduinoJson** libraries.
-2. Copy `secrets.example.h` to `secrets.h` and put your WiFi details in it.
-   `secrets.h` is git ignored, so your password stays on your machine.
+2. Optionally copy `secrets.example.h` to `secrets.h` and put your WiFi
+   details in it. This only seeds a device that has nothing saved yet, so
+   the first boot connects without visiting the setup portal. `secrets.h` is
+   git ignored, so your password stays on your machine and never reaches the
+   published firmware.
 3. Set **Tools > Partition Scheme > Minimal SPIFFS (1.9MB APP with OTA)**.
    This matters: schemes without an OTA slot cannot self-update.
 4. Upload.

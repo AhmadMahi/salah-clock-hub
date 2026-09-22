@@ -64,6 +64,7 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <Update.h>
+#include <DNSServer.h>
 #include "espnow_packet.h"
 
 // ArduinoJson v6 / v7 compatibility
@@ -77,9 +78,13 @@
 // USER CONFIGURATION
 // =====================================================
 
-// Your WiFi details live in secrets.h, which git ignores, so they never
-// reach the repo. Copy secrets.example.h to secrets.h and edit it.
-// Without that file the sketch still builds, using the placeholders below.
+// WiFi credentials are stored in flash (NVS) and are set from the on-device
+// setup portal, so they survive every firmware update.
+//
+// secrets.h is only a convenience for USB builds: if flash has no network
+// saved yet, whatever is in secrets.h is used for the first connection and
+// then written to flash. secrets.h is git ignored, so the published firmware
+// never carries anyone's password.
 #if __has_include("secrets.h")
   #include "secrets.h"
 #endif
@@ -94,7 +99,7 @@ const char* HOSTNAME = "salah-clock";           // -> http://salah-clock.local
 #define DEVICE_NAME    "NEXUS"
 #define DEVICE_TAGLINE "MASTER HUB"
 
-#define FW_VERSION "3.2.0"
+#define FW_VERSION "3.3.0"
 #define OTA_REPO   "AhmadMahi/salah-clock-hub"
 #define OTA_ASSET  "salah_clock_hub.bin"
 
@@ -199,6 +204,15 @@ float  locLon = DEFAULT_LON;
 
 Preferences prefs;
 WebServer   server(80);
+DNSServer   dnsServer;
+
+// ---- WiFi credentials + setup portal ----
+String wifiSsid = "";
+String wifiPass = "";
+bool   apMode      = false;        // true while the setup portal is running
+String apSsid      = "";
+String apPass      = "nexus1234";  // WPA2 needs at least 8 characters
+unsigned long nextStaRetry = 0;
 
 // =====================================================
 // PRAYER DATA
@@ -529,6 +543,17 @@ void loadSettings() {
   botSafe         = prefs.getInt("botsafe",  8);
   brightness      = prefs.getInt("bright",   255);
 
+  wifiSsid = prefs.getString("wssid", "");
+  wifiPass = prefs.getString("wpass", "");
+  // Seed a blank device from secrets.h, if it holds anything real
+  if (wifiSsid.length() == 0 && strcmp(WIFI_SSID, "YOUR_WIFI_NAME") != 0) {
+    wifiSsid = WIFI_SSID;
+    wifiPass = WIFI_PASSWORD;
+    prefs.putString("wssid", wifiSsid);
+    prefs.putString("wpass", wifiPass);
+    Serial.println("WiFi: seeded from secrets.h");
+  }
+
   locCity  = prefs.getString("city", DEFAULT_CITY);
   locLat   = prefs.getFloat("lat", DEFAULT_LAT);
   locLon   = prefs.getFloat("lon", DEFAULT_LON);
@@ -546,6 +571,14 @@ void loadSettings() {
   if (locCity.length() == 0) locCity = DEFAULT_CITY;
   if (hubName.length() == 0) hubName = "hub";
   if (hubName.length() > 15) hubName = hubName.substring(0, 15);
+}
+
+void saveWifiCreds(const String& ssid, const String& pass) {
+  wifiSsid = ssid;
+  wifiPass = pass;
+  prefs.putString("wssid", wifiSsid);
+  prefs.putString("wpass", wifiPass);
+  Serial.println("WiFi credentials saved: " + wifiSsid);
 }
 
 void saveLocation() {
@@ -671,8 +704,68 @@ void startMDNS() {
   }
 }
 
+void drawBootScreen();                   // defined further down
+
+// Blocking join, used on boot and when retrying from the portal
+bool connectSTA(unsigned long timeoutMs, bool paint) {
+  if (wifiSsid.length() == 0) return false;
+
+  WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeoutMs) {
+    if (paint) drawBootScreen();
+    delay(120);
+  }
+  return WiFi.status() == WL_CONNECTED;
+}
+
+// Opens the setup access point. The clock shows how to join it and stays
+// here until a network is saved, or until the old one comes back.
+void startConfigPortal() {
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  char nm[20];
+  snprintf(nm, sizeof(nm), "NEXUS-%02X%02X", mac[4], mac[5]);
+  apSsid = String(nm);
+
+  WiFi.mode(WIFI_AP_STA);                      // AP for setup, STA to keep retrying
+  WiFi.softAP(apSsid.c_str(), apPass.c_str());
+  delay(300);
+
+  dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
+  dnsServer.start(53, "*", WiFi.softAPIP());   // captive portal: every name -> us
+
+  apMode       = true;
+  nextStaRetry = millis() + 120000UL;
+
+  Serial.println("=== WiFi setup portal ===");
+  Serial.println("  join    : " + apSsid + "  /  " + apPass);
+  Serial.println("  then go : http://" + WiFi.softAPIP().toString());
+}
+
 void maintainWiFi() {
   static unsigned long lastTry = 0;
+
+  if (apMode) {
+    dnsServer.processNextRequest();
+
+    // If the saved network comes back on its own, take it and restart clean
+    if (wifiSsid.length() && due(nextStaRetry)) {
+      nextStaRetry = millis() + 120000UL;
+      Serial.println("Portal: retrying the saved network...");
+      WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+      unsigned long t0 = millis();
+      while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000UL) delay(100);
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("Portal: network is back, restarting");
+        delay(300);
+        ESP.restart();
+      }
+      WiFi.disconnect();
+    }
+    return;
+  }
 
   if (WiFi.status() == WL_CONNECTED) {
     if (!mdnsStarted) startMDNS();
@@ -685,7 +778,7 @@ void maintainWiFi() {
     lastTry = millis();
     Serial.println("WiFi lost, reconnecting...");
     WiFi.disconnect();
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    if (wifiSsid.length()) WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
   }
 }
 
@@ -1730,18 +1823,20 @@ void runBootSequence() {
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.setSleep(false);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  unsigned long s = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - s < 20000UL) {
-    drawBootScreen();
-    delay(120);
-  }
-  bool wifiOk = (WiFi.status() == WL_CONNECTED);
+  bool wifiOk = connectSTA(20000UL, true);
   bootRows[0].state = wifiOk ? 2 : 3;
+  bootRows[0].value = wifiOk ? (wifiSsid.length() > 12 ? wifiSsid.substring(0, 12) : wifiSsid)
+                             : String("SETUP");
   if (wifiOk) startMDNS();
   drawBootScreen();
   delay(250);
+
+  // No network: open the setup portal and stay there
+  if (!wifiOk) {
+    startConfigPortal();
+    return;                                  // setup() starts the web server next
+  }
 
   // ---- Time
   bootRows[1].state = 1;
@@ -1749,7 +1844,7 @@ void runBootSequence() {
   configTzTime(TZ_INFO, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
 
   struct tm t;
-  s = millis();
+  unsigned long s = millis();
   while (!getNow(t) && wifiOk && millis() - s < 15000UL) {
     drawBootScreen();
     delay(120);
@@ -2437,6 +2532,47 @@ void drawAlertScreen(unsigned long el) {
 }
 
 // =====================================================
+// WIFI SETUP SCREEN
+// =====================================================
+
+void drawApScreen() {
+  u8g2.clearBuffer();
+  u8g2.setDrawColor(1);
+
+  u8g2.setFont(FONT_SMALL);
+  pCenter("WIFI SETUP", yHead());
+
+  int top  = yRule() + 3;
+  int room = areaBot() - top;
+  int step = room >= 33 ? 11 : (room >= 27 ? 9 : 8);
+  int y1   = areaBot() - 1 - step * 2;          // three lines anchored to the bottom
+
+  // on a deeply trimmed panel the rule would collide with the first line
+  if (y1 - 8 >= yRule()) pHLine(MARGIN, yRule(), CONTENT_W);
+
+  const int LABEL_W = 30;
+  u8g2.setFont(FONT_SMALL);
+
+  pStr(MARGIN, y1, "JOIN");
+  pStr(MARGIN + LABEL_W, y1, clip(apSsid, CONTENT_W - LABEL_W));
+
+  pStr(MARGIN, y1 + step, "PASS");
+  pStr(MARGIN + LABEL_W, y1 + step, clip(apPass, CONTENT_W - LABEL_W));
+
+  pStr(MARGIN, y1 + step * 2, "OPEN");
+  pStr(MARGIN + LABEL_W, y1 + step * 2, WiFi.softAPIP().toString());
+
+  // a quiet pulse so the screen never looks frozen
+  int p = (millis() / 220) % 4;
+  for (int i = 0; i < 3; i++) {
+    if (i < p) pDisc(SCREEN_W - MARGIN - 2 - (2 - i) * 6, yHead() - 2, 1);
+    else       pPixel(SCREEN_W - MARGIN - 2 - (2 - i) * 6, yHead() - 2);
+  }
+
+  u8g2.sendBuffer();
+}
+
+// =====================================================
 // SAFE AREA CALIBRATION SCREEN
 // =====================================================
 
@@ -2531,6 +2667,12 @@ void checkPrayerAlerts() {
 
 void updateDisplay() {
   unsigned long now = millis();
+
+  // ---- 0. setup portal owns the screen while it is open
+  if (apMode) {
+    if (frameDue(980, 200)) drawApScreen();
+    return;
+  }
 
   // ---- 1. calibration overlay wins over everything except alerts
   if (mode == MODE_CALIB) {
@@ -2755,6 +2897,13 @@ input[type=checkbox]:checked::after{left:21px}
 </section>
 
 <section>
+  <h2>Network</h2>
+  <p class="hint" id="netnote"></p>
+  <div class="btns"><button class="ghost" onclick="forgetWifi()">Change WiFi network</button></div>
+  <p class="hint">The hub restarts and opens its own setup access point. Join it with the name and password shown on the display, then pick your new network.</p>
+</section>
+
+<section>
   <h2>Panel calibration</h2>
   <p class="hint">Nothing is ever drawn inside these rows, and the rest of the screen is filled evenly between them. Raise "top safe rows" until every line is sharp, and keep a few "bottom safe rows" so no text sits on the bezel.</p>
   <label class="field"><span>Top safe rows: <b id="tsv"></b> px</span><input type="range" data-k="topsafe" min="0" max="28" step="1" oninput="tsv.textContent=this.value"></label>
@@ -2893,6 +3042,9 @@ function render(s){
     ?s.nodes.map(n=>'<div class="node"><span>'+esc(n.name)+'<br><small style="color:var(--muted)">'+esc(n.mac)+'</small></span><span>'+esc(n.age)+'<br>'+n.rssi+' dBm, '+n.packets+' pkt</span></div>').join('')
     :'<p class="hint">No node has spoken to the hub yet.</p>';
 
+  $('#netnote').innerHTML=s.wifi
+    ?('Connected to <b>'+esc(s.ssid)+'</b> at '+esc(s.ip)+', '+s.rssi+' dBm, channel '+s.channel+'.')
+    :('Not connected. Saved network: <b>'+esc(s.wifiSsid||'none')+'</b>.');
   $('#fwnote').innerHTML='Running <b>'+esc(s.fw)+'</b>'
     +(s.otaLatest?(', latest on GitHub <b>'+esc(s.otaLatest)+'</b>'):'')
     +'. '+esc(s.otaStatus)+'.<br><small style="color:var(--muted)">'+esc(s.otaRepo)+'</small>';
@@ -2919,6 +3071,10 @@ async function sendMsg(share){
   try{await post('/api/message',{message:m,share:share?'1':'0'});toast(share?'Sent to clock and nodes':'Sent to clock');$('#msg').value='';load(false)}
   catch(e){toast(e.message)}
 }
+async function forgetWifi(){
+  if(!confirm('Forget the saved network and restart into setup mode?\n\nYou will lose this page until the hub is back on a network.'))return;
+  try{await post('/api/forget',{});toast('Restarting into setup mode')}catch(e){toast('Restarting into setup mode')}
+}
 async function delMsg(i){
   try{await post('/api/msgdel',{i:i});load(false)}catch(e){toast(e.message)}
 }
@@ -2929,6 +3085,83 @@ async function act(url,data,ok){
 $('[data-k=autoloc]').addEventListener('change',syncLoc);
 load(true);
 setInterval(()=>load(false),4000);
+</script>
+</body>
+</html>
+)rawliteral";
+
+const char SETUP_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Nexus setup</title>
+<style>
+:root{--bg:#eef2f5;--card:#fff;--fg:#16222e;--muted:#5f6f7e;--line:#d8e0e6;--band:#10202f;--bandfg:#eaf1f6;--acc:#0f766e;--accfg:#fff}
+@media(prefers-color-scheme:dark){:root{--bg:#0b1218;--card:#111c25;--fg:#e5edf3;--muted:#8a9aa8;--line:#1f2d3a;--band:#0f1b27;--acc:#2dd4bf;--accfg:#04201c}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 "Segoe UI",system-ui,-apple-system,Roboto,sans-serif}
+.band{background:var(--band);color:var(--bandfg);padding:22px 18px}
+.wrap{max-width:460px;margin:0 auto}
+.band h1{margin:0;font-size:20px}
+.band p{margin:4px 0 0;font-size:13px;opacity:.75}
+main{padding:18px}
+h2{font-size:16px;margin:18px 0 6px}
+.hint{color:var(--muted);font-size:13px;margin:0 0 10px}
+label span{display:block;font-size:13px;color:var(--muted);margin:10px 0 4px}
+input{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);font:inherit}
+button{font:inherit;font-weight:600;padding:12px 16px;border:0;border-radius:8px;background:var(--acc);color:var(--accfg);cursor:pointer;width:100%;margin-top:16px}
+button.ghost{background:transparent;color:var(--fg);border:1px solid var(--line);margin-top:8px}
+.net{display:flex;justify-content:space-between;align-items:center;gap:10px;width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);cursor:pointer;margin-bottom:6px;text-align:left;font:inherit}
+.net b{font-weight:600}
+.net span{color:var(--muted);font-size:12.5px;white-space:nowrap}
+#msg{margin-top:12px;font-size:14px;color:var(--acc);min-height:20px}
+</style>
+</head>
+<body>
+<div class="band"><div class="wrap">
+  <h1>Nexus setup</h1>
+  <p>Choose the network this hub should join.</p>
+</div></div>
+<main class="wrap">
+  <h2>Networks nearby</h2>
+  <p class="hint" id="scanning">Scanning...</p>
+  <div id="nets"></div>
+  <button class="ghost" onclick="scan()">Scan again</button>
+
+  <h2>Connect</h2>
+  <label><span>Network name</span><input id="ssid" maxlength="32" placeholder="Your WiFi name"></label>
+  <label><span>Password</span><input id="pass" type="password" maxlength="63" placeholder="Leave empty for an open network"></label>
+  <button onclick="save()">Save and restart</button>
+  <p id="msg"></p>
+</main>
+<script>
+const $=s=>document.querySelector(s);
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+async function scan(){
+  $('#scanning').textContent='Scanning...';$('#nets').innerHTML='';
+  try{
+    const r=await fetch('/api/scan',{cache:'no-store'});
+    const j=await r.json();
+    $('#scanning').textContent=j.nets.length?'Tap one to fill it in.':'Nothing found. Try scanning again.';
+    $('#nets').innerHTML=j.nets.map(n=>
+      '<button class="net" onclick="pick(this.dataset.s)" data-s="'+esc(n.ssid)+'">'
+      +'<b>'+esc(n.ssid)+'</b><span>'+(n.lock?'locked ':'open ')+n.rssi+' dBm</span></button>').join('');
+  }catch(e){$('#scanning').textContent='Scan failed. Try again.'}
+}
+function pick(s){$('#ssid').value=s;$('#pass').focus()}
+async function save(){
+  const ssid=$('#ssid').value.trim();
+  if(!ssid){$('#msg').textContent='Enter a network name first.';return}
+  $('#msg').textContent='Saving...';
+  try{
+    await fetch('/api/wifi',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:new URLSearchParams({ssid:ssid,pass:$('#pass').value})});
+    $('#msg').textContent='Saved. The hub is restarting and will join '+ssid+'. You can close this page.';
+  }catch(e){$('#msg').textContent='Saved. The hub is restarting.'}
+}
+scan();
 </script>
 </body>
 </html>
@@ -2959,7 +3192,56 @@ int argInt(const char* name, int cur, int lo, int hi) {
 }
 
 void handleRoot() {
+  // While the setup portal is open, every page is the setup page
+  if (apMode) {
+    server.send_P(200, "text/html; charset=utf-8", SETUP_PAGE);
+    return;
+  }
   server.send_P(200, "text/html; charset=utf-8", MAIN_PAGE);
+}
+
+void handleScan() {
+  int n = WiFi.scanNetworks();
+  String o = "{\"nets\":[";
+  int shown = 0;
+  for (int i = 0; i < n && shown < 20; i++) {
+    String ss = WiFi.SSID(i);
+    if (ss.length() == 0) continue;
+    if (shown) o += ',';
+    o += '{';
+    jStr(o, "ssid", ss);
+    jNum(o, "rssi", WiFi.RSSI(i));
+    jBool(o, "lock", WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
+    jEnd(o);
+    o += '}';
+    shown++;
+  }
+  o += "]}";
+  WiFi.scanDelete();
+  sendJson(200, o);
+}
+
+void handleWifiSave() {
+  String ssid = server.arg("ssid");
+  String pass = server.arg("pass");
+  ssid.trim();
+  if (ssid.length() == 0) { sendError(400, "Network name is empty."); return; }
+  if (ssid.length() > 32) ssid = ssid.substring(0, 32);
+  if (pass.length() > 63) pass = pass.substring(0, 63);
+
+  saveWifiCreds(ssid, pass);
+  sendOk();
+
+  // let the reply reach the browser before the board restarts
+  delay(400);
+  ESP.restart();
+}
+
+void handleWifiForget() {
+  saveWifiCreds("", "");
+  sendOk();
+  delay(400);
+  ESP.restart();
 }
 
 void handleState() {
@@ -2983,6 +3265,8 @@ void handleState() {
 
   jBool(o, "wifi", WiFi.status() == WL_CONNECTED);
   jStr(o, "ssid", WiFi.SSID());
+  jBool(o, "apMode", apMode);
+  jStr(o, "wifiSsid", wifiSsid);
   jStr(o, "ip", WiFi.localIP().toString());
   jStr(o, "mac", WiFi.macAddress());
   jNum(o, "rssi", WiFi.RSSI());
@@ -3331,12 +3615,22 @@ void setupWebServer() {
   server.on("/api/dismiss",   HTTP_POST, handleDismiss);
   server.on("/api/calib",     HTTP_POST, handleCalib);
   server.on("/api/ota",       HTTP_POST, handleOta);
+  server.on("/api/scan",      HTTP_GET,  handleScan);
+  server.on("/api/wifi",      HTTP_POST, handleWifiSave);
+  server.on("/api/forget",    HTTP_POST, handleWifiForget);
 
   // handy for other services: http://salah-clock.local/api/message?message=Hi
   server.on("/api/message", HTTP_GET, handleMessage);
 
   server.on("/favicon.ico", HTTP_GET, []() { server.send(204); });
-  server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
+  server.onNotFound([]() {
+    if (apMode) {                              // captive portal catch-all
+      server.sendHeader("Location", String("http://") + WiFi.softAPIP().toString(), true);
+      server.send(302, "text/plain", "");
+      return;
+    }
+    server.send(404, "text/plain", "Not found");
+  });
 
   server.begin();
   Serial.println("Web server started.");
