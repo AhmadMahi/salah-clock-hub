@@ -1,15 +1,16 @@
 /*
   ================================================================
-   ESP32 SMART SALAH CLOCK + ESP-NOW MASTER HUB   -   v3
+   NEXUS  -  ESP32 MASTER HUB (ESP-NOW + Salah clock)   v3.2
   ================================================================
    OLED : SH1106 128x64 I2C   (SDA = GPIO 21, SCL = GPIO 22)
 
-   WHAT IS NEW IN v3
-   - Smartwatch style card carousel every N minutes (default 3):
-       Card 1  NEXT PRAYER in big type + countdown
-       Card 2  TEMPERATURE + HUMIDITY
-       Card 3  MESSAGE QUEUE (newest first, auto cycling)
-     Cards slide in and out with eased motion, 30 fps.
+   WHAT IT DOES
+   - Idle face: the time, centred, with one scrolling line under it
+     carrying the date, next prayer, temperature, humidity, unread
+     message count, city and signal strength.
+   - Every minute it slides to the MESSAGE QUEUE, cycles through what
+     arrived, and slides back. Empty queue shows "No messages".
+     Optional extra slides for next prayer and weather (off by default).
    - ESP-NOW master hub
        * receives messages and sensor data from other ESP32 nodes
        * keeps the last 15 messages in a queue (newest first)
@@ -90,7 +91,10 @@
 const char* HOSTNAME = "salah-clock";           // -> http://salah-clock.local
 
 // ---- firmware identity and over-the-air updates ----
-#define FW_VERSION "3.1.0"
+#define DEVICE_NAME    "NEXUS"
+#define DEVICE_TAGLINE "MASTER HUB"
+
+#define FW_VERSION "3.2.0"
 #define OTA_REPO   "AhmadMahi/salah-clock-hub"
 #define OTA_ASSET  "salah_clock_hub.bin"
 
@@ -162,8 +166,8 @@ const unsigned long SENSOR_FRESH_MS = 900000; // node telemetry valid for 15 min
 // =====================================================
 
 bool showClock       = true;    // main clock on the screen
-bool showNextPrayer  = true;    // next-prayer card in the carousel
-bool showWeatherCard = true;    // temperature / humidity card
+bool showNextPrayer  = false;   // next-prayer card (the ticker already says it)
+bool showWeatherCard = false;   // weather card (the ticker already says it)
 bool showMsgCard     = true;    // message queue card
 bool showVerse       = true;    // Quran verse during alert
 bool prayerAlerts    = true;    // master switch for prayer-time alerts
@@ -181,7 +185,7 @@ bool shareSync       = true;    // broadcast time + prayer times to nodes
 bool otaAuto         = true;    // check GitHub for new firmware on boot and daily
 
 uint8_t alertMask    = 0x1F;    // bit0..4 = Fajr, Dhuhr, Asr, Maghrib, Isha
-int slotMinutes      = 3;       // carousel every N minutes
+int slotMinutes      = 1;       // show the message list every N minutes
 int cardSeconds      = 4;       // seconds per card
 int messageSeconds   = 6;       // minimum time a popup message stays on screen
 int alertSeconds     = 60;      // total length of a prayer alert
@@ -493,11 +497,11 @@ void applyBrightness() {
 }
 
 void loadSettings() {
-  prefs.begin("salah3", false);
+  prefs.begin("salah4", false);
 
   showClock       = prefs.getBool("clock",   true);
-  showNextPrayer  = prefs.getBool("next",    true);
-  showWeatherCard = prefs.getBool("wxcard",  true);
+  showNextPrayer  = prefs.getBool("next",    false);
+  showWeatherCard = prefs.getBool("wxcard",  false);
   showMsgCard     = prefs.getBool("msgcard", true);
   showVerse       = prefs.getBool("verse",   true);
   prayerAlerts    = prefs.getBool("alerts",  true);
@@ -515,7 +519,7 @@ void loadSettings() {
   otaAuto         = prefs.getBool("ota",     true);
 
   alertMask       = prefs.getUChar("mask", 0x1F);
-  slotMinutes     = prefs.getInt("slot",     3);
+  slotMinutes     = prefs.getInt("slot",     1);
   cardSeconds     = prefs.getInt("cardsec",  4);
   messageSeconds  = prefs.getInt("msgsec",   6);
   alertSeconds    = prefs.getInt("alertsec", 60);
@@ -1518,10 +1522,11 @@ void drawHappyEye(int cx, int cy) {
   }
 }
 
-// zLift 0..1 animates the floating z's; titleWipe 0..1 wipes the name in
-void eyesFrame(int h, int px, int py, bool happy, float zLift, float titleWipe) {
-  int cy = areaTop() + (areaH() * 4) / 10;
-  if (cy < 18) cy = 18;
+// zLift 0..1 animates the floating z's
+void eyesFrame(int h, int px, int py, bool happy, float zLift) {
+  int maxH = min(30, areaH() - 4);          // shrink the eyes on a trimmed panel
+  if (h > maxH) h = maxH;
+  int cy = areaTop() + areaH() / 2;
 
   u8g2.clearBuffer();
   u8g2.setDrawColor(1);
@@ -1535,23 +1540,66 @@ void eyesFrame(int h, int px, int py, bool happy, float zLift, float titleWipe) 
   }
 
   if (zLift > 0) {
-    u8g2.setFont(FONT_SMALL);
-    int base = cy - 4;
     float a = fmodf(zLift, 1.0f);
-    u8g2.drawStr(112, base - (int)(a * 8.0f), "z");
+    int lo = areaTop() + 8;                 // the z's must not drift out of the band
+    u8g2.setFont(FONT_SMALL);
+    u8g2.drawStr(112, max(lo, cy - 4 - (int)(a * 8.0f)), "z");
     u8g2.setFont(FONT_BODY);
-    u8g2.drawStr(114, base - 9 - (int)(a * 10.0f), "Z");
+    u8g2.drawStr(114, max(lo, cy - 13 - (int)(a * 10.0f)), "Z");
   }
 
-  if (titleWipe > 0) {
-    u8g2.setFont(u8g2_font_helvB10_tr);
-    String s = "SALAH CLOCK";
-    int w = u8g2.getStrWidth(s.c_str());
-    int x = (SCREEN_W - w) / 2;
-    int y = areaBot() - 1;
-    u8g2.setClipWindow(x, y - 12, x + (int)(w * easeOut(titleWipe)) + 1, y + 3);
-    u8g2.drawStr(x, y, s.c_str());
+  u8g2.sendBuffer();
+}
+
+// Hub mark: a core with satellite nodes on spokes, and a pulse travelling out
+// Fits inside a 9 px radius, pulse ring included
+void drawHubMark(int cx, int cy, float pulse) {
+  for (int i = 0; i < 6; i++) {
+    float a = i * 1.0471976f - 1.5708f;          // six nodes, first one straight up
+    int sx = cx + (int)(cosf(a) * 7.0f);
+    int sy = cy + (int)(sinf(a) * 7.0f);
+    u8g2.drawLine(cx, cy, sx, sy);
+    u8g2.drawDisc(sx, sy, 1);
+  }
+  u8g2.drawDisc(cx, cy, 3);
+
+  if (pulse > 0.0f) {
+    u8g2.drawCircle(cx, cy, 4 + (int)(fmodf(pulse, 1.0f) * 5.0f));
+  }
+}
+
+// Name plate. wipe 0..1 reveals the wordmark left to right.
+void drawLogoScreen(float wipe, float pulse) {
+  int ySub  = areaBot() - 1;
+  int yName = ySub - 10;
+  int markBot = yName - 14;
+  int markSpace = markBot - areaTop();
+  bool showMark = markSpace >= 19;
+
+  u8g2.clearBuffer();
+  u8g2.setDrawColor(1);
+
+  if (showMark) {
+    int mcy = constrain(areaTop() + markSpace / 2, areaTop() + 9, markBot - 9);
+    drawHubMark(SCREEN_W / 2, mcy, pulse);
+  }
+
+  u8g2.setFont(u8g2_font_helvB14_tr);
+  String name = DEVICE_NAME;
+  int w = u8g2.getStrWidth(name.c_str());
+  int x = (SCREEN_W - w) / 2;
+  if (wipe >= 1.0f) {
+    u8g2.drawStr(x, yName, name.c_str());
+  } else if (wipe > 0.0f) {
+    u8g2.setClipWindow(x, yName - 15, x + (int)(w * easeOut(wipe)) + 1, yName + 2);
+    u8g2.drawStr(x, yName, name.c_str());
     u8g2.setMaxClipWindow();
+  }
+
+  if (wipe >= 1.0f) {
+    u8g2.setFont(FONT_SMALL);
+    String sub = DEVICE_TAGLINE;
+    u8g2.drawStr((SCREEN_W - u8g2.getStrWidth(sub.c_str())) / 2, ySub, sub.c_str());
   }
 
   u8g2.sendBuffer();
@@ -1561,36 +1609,33 @@ void eyesFrame(int h, int px, int py, bool happy, float zLift, float titleWipe) 
 void wakeUpAnimation() {
   unsigned long t0 = millis();
 
-  // 1) asleep, z's drifting up (1.8 s)
+  // 1) asleep, z's drifting up
   while (millis() - t0 < 1800) {
     float el = (millis() - t0) / 1000.0f;
-    eyesFrame(0, 0, 0, false, el > 0.35f ? el * 1.2f : 0.0f, 0);
+    eyesFrame(0, 0, 0, false, el > 0.35f ? el * 1.2f : 0.0f);
     delay(FRAME_MS);
   }
 
-  // 2) groggy flutter, then a smooth eased open (1.4 s)
+  // 2) groggy flutter, then a smooth eased open
   t0 = millis();
   while (millis() - t0 < 1400) {
     float p = (millis() - t0) / 1400.0f;
     int h;
     if (p < 0.35f) {
-      float f = sinf(p * 28.0f);                       // flutter
-      h = (int)(4.0f + 3.0f * f);
+      h = (int)(4.0f + 3.0f * sinf(p * 28.0f));
       if (h < 0) h = 0;
     } else {
       h = (int)(30.0f * easeOut((p - 0.35f) / 0.65f));
     }
-    eyesFrame(h, 0, 0, false, 0, 0);
+    eyesFrame(h, 0, 0, false, 0);
     delay(FRAME_MS);
   }
 
-  // 3) look around on a smooth sine path (1.6 s)
+  // 3) look around on a smooth sine path
   t0 = millis();
   while (millis() - t0 < 1600) {
     float p = (millis() - t0) / 1600.0f;
-    int px = (int)(8.0f * sinf(p * 6.2832f));
-    int py = (int)(2.5f * sinf(p * 12.566f));
-    eyesFrame(30, px, py, false, 0, 0);
+    eyesFrame(30, (int)(8.0f * sinf(p * 6.2832f)), (int)(2.5f * sinf(p * 12.566f)), false, 0);
     delay(FRAME_MS);
   }
 
@@ -1599,18 +1644,26 @@ void wakeUpAnimation() {
     t0 = millis();
     while (millis() - t0 < 260) {
       float p = (millis() - t0) / 260.0f;
-      int h = (int)(30.0f * fabsf(cosf(p * 3.1416f)));
-      eyesFrame(max(h, 1), 0, 0, false, 0, 0);
+      eyesFrame(max((int)(30.0f * fabsf(cosf(p * 3.1416f))), 1), 0, 0, false, 0);
       delay(FRAME_MS);
     }
     delay(180);
   }
 
-  // 5) smile + the name wiping in
+  // 5) smile
   t0 = millis();
-  while (millis() - t0 < 1500) {
-    float p = (millis() - t0) / 700.0f;
-    eyesFrame(0, 0, 0, true, 0, p);
+  while (millis() - t0 < 700) {
+    eyesFrame(0, 0, 0, true, 0);
+    delay(FRAME_MS);
+  }
+
+  // 6) name plate: the mark pulses, then the wordmark wipes in
+  t0 = millis();
+  while (millis() - t0 < 2400) {
+    unsigned long el = millis() - t0;
+    float pulse = el / 900.0f;
+    float wipe  = (el < 700) ? 0.0f : min(1.0f, (el - 700) / 600.0f);
+    drawLogoScreen(wipe, pulse);
     delay(FRAME_MS);
   }
 
@@ -1765,10 +1818,20 @@ String buildTicker() {
   String o = "";
   const char* SEP = "   |   ";
 
+  struct tm dt;
+  if (getNow(dt)) {
+    char db[20];
+    strftime(db, sizeof(db), "%a %d %b", &dt);
+    o += String(db);
+    o.toUpperCase();
+  }
+
   if (weatherValid() && !isnan(wxTemp)) {
+    if (o.length()) o += SEP;
     o += String((int)roundf(toDisplayTemp(wxTemp)));
     o += useFahrenheit ? " F" : " C";
   }
+
   if (weatherValid() && !isnan(wxHum)) {
     if (o.length()) o += SEP;
     o += String((int)roundf(wxHum)) + "% humidity";
@@ -1793,7 +1856,12 @@ String buildTicker() {
     o += locCity;
   }
 
-  if (o.length() == 0) o = "Salah Clock";
+  if (o.length()) o += SEP;
+  o += (WiFi.status() == WL_CONNECTED)
+         ? ("signal " + String(WiFi.RSSI()) + " dBm")
+         : String("WiFi offline");
+
+  if (o.length() == 0) o = DEVICE_NAME "  " DEVICE_TAGLINE;
   return o;
 }
 
@@ -1833,10 +1901,8 @@ void drawTicker(int baseline) {
 }
 
 // ---------------------------------------------------------------
-//  Clock face
-//    big time            top of the band, PM and seconds beside it
-//    date  |  signal     one small row
-//    ticker              temperature, next salah, messages, city
+//  Clock face: just the time, centred, with one scrolling line under
+//  it carrying the date, prayer, weather, signal and message count.
 // ---------------------------------------------------------------
 void drawCardClock(int dx) {
   gOX = dx;
@@ -1858,17 +1924,16 @@ void drawCardClock(int dx) {
   strftime(ss, sizeof(ss), "%S", &t);
   strftime(ap, sizeof(ap), "%p", &t);
 
-  bool hasTicker = areaH() >= 34;               // three rows only when they fit
-  int yScroll = areaBot() - 1;                  // scrolling line
-  int yInfo   = hasTicker ? areaBot() - 11 : areaBot() - 1;
-  int avail   = yInfo - 9 - areaTop();          // room left for the big numerals
+  bool hasTicker = areaH() >= 26;
+  int yScroll = areaBot() - 1;                       // scrolling line
+  int botLimit = hasTicker ? (yScroll - 9) : areaBot();
+  int avail = botLimit - areaTop();
 
   const uint8_t* bigFont = u8g2_font_logisoso24_tn;
   int fh = 24;
   if (avail < 24) { bigFont = u8g2_font_logisoso20_tn; fh = 20; }
   if (avail < 20) { bigFont = u8g2_font_helvB14_tr;    fh = 14; }
 
-  // ---------- big time, sitting at the top of the band ----------
   u8g2.setFont(bigFont);
   int wHH = u8g2.getStrWidth(hh);
   int wC  = u8g2.getStrWidth(":");
@@ -1881,7 +1946,8 @@ void drawCardClock(int dx) {
   int bx = (SCREEN_W - total) / 2;
   if (bx < MARGIN) bx = MARGIN;
 
-  int bBase = areaTop() + fh;
+  // sit the numerals in the middle of the room above the ticker
+  int bBase = areaTop() + fh + (avail - fh) / 2;
 
   u8g2.setFont(bigFont);
   pStr(bx, bBase, hh);
@@ -1892,22 +1958,6 @@ void drawCardClock(int dx) {
   pStr(bx + bw + 5, bBase - fh + 8, ap);
   if (fh >= 20) pStr(bx + bw + 5, bBase, ss);            // seconds only when there is room
 
-  // ---------- date on the left, signal on the right ----------
-  u8g2.setFont(FONT_SMALL);
-  char db[16];
-  strftime(db, sizeof(db), "%a %d %b", &t);
-  String date = String(db);
-  date.toUpperCase();
-  pStr(MARGIN, yInfo, date);
-
-  bool up = (WiFi.status() == WL_CONNECTED);
-  String rs = up ? String(WiFi.RSSI()) : String("--");
-  int rw = strW(rs);
-  int gx = SCREEN_W - MARGIN - rw - 14;                  // icon first, then the number
-  icoWifi(gx, yInfo, wifiBars());
-  pStr(SCREEN_W - MARGIN - rw, yInfo, rs);
-
-  // ---------- scrolling info line ----------
   if (hasTicker) drawTicker(yScroll);
 
   gOX = 0;
@@ -2093,9 +2143,7 @@ void drawCardMessages(int dx, unsigned long el) {
   if (msgCount == 0) {
     pHLine(MARGIN, yRule(), CONTENT_W);
     u8g2.setFont(FONT_BODY);
-    pCenter("Inbox is empty", bodyTop + (bodyBot - bodyTop) / 2);
-    u8g2.setFont(FONT_SMALL);
-    pCenter("send one from any node", bodyBot - 1);
+    pCenter("No messages", bodyTop + (bodyBot - bodyTop) / 2 + 3);
     gOX = 0;
     return;
   }
@@ -2173,7 +2221,7 @@ void buildPlaylist() {
   playCount = 0;
   if (showNextPrayer && prayerOk)          playlist[playCount++] = CARD_NEXT;
   if (showWeatherCard && weatherValid())   playlist[playCount++] = CARD_WEATHER;
-  if (showMsgCard && customMessages && msgCount > 0) playlist[playCount++] = CARD_MSG;
+  if (showMsgCard && customMessages) playlist[playCount++] = CARD_MSG;   // shown even when empty
   playIndex = 0;
 }
 
@@ -2590,7 +2638,7 @@ const char MAIN_PAGE[] PROGMEM = R"rawliteral(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Salah Clock Hub</title>
+<title>Nexus Hub</title>
 <style>
 :root{--bg:#eef2f5;--card:#fff;--fg:#16222e;--muted:#5f6f7e;--line:#d8e0e6;--band:#10202f;--bandfg:#eaf1f6;--acc:#0f766e;--accfg:#fff;--warn:#b45309;--knob:#fff;--off:#9aa8b4}
 @media(prefers-color-scheme:dark){:root{--bg:#0b1218;--card:#111c25;--fg:#e5edf3;--muted:#8a9aa8;--line:#1f2d3a;--band:#0f1b27;--bandfg:#eaf1f6;--acc:#2dd4bf;--accfg:#04201c;--warn:#fbbf24;--off:#4b5b69}}
@@ -2646,7 +2694,7 @@ input[type=checkbox]:checked::after{left:21px}
 <body>
 
 <div class="band"><div class="wrap">
-  <h1>Salah Clock Hub</h1>
+  <h1>Nexus &middot; master hub</h1>
   <div class="time" id="clock">--:--</div>
   <div class="sub" id="date">Connecting to the clock...</div>
   <div class="chips" id="chips"></div>
@@ -3322,7 +3370,7 @@ void setup() {
   lastDrawn  = -99;
 
   Serial.println("================================");
-  Serial.printf(" SMART SALAH CLOCK HUB %s READY\n", FW_VERSION);
+  Serial.printf(" %s %s - %s READY\n", DEVICE_NAME, DEVICE_TAGLINE, FW_VERSION);
   if (WiFi.status() == WL_CONNECTED) {
     Serial.print(" Web panel : http://");
     Serial.println(WiFi.localIP());

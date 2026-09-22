@@ -1,30 +1,31 @@
-# Salah Clock Hub
+# NEXUS - ESP32 master hub
 
-An ESP32 prayer clock on a 128x64 SH1106 OLED that doubles as an ESP-NOW
-master hub: it collects messages and sensor readings from other ESP32 nodes,
-keeps a 15 message queue, and broadcasts time, prayer times and weather back
-out to them. It updates its own firmware from this repo's releases.
+A 128x64 OLED hub on an ESP32. It takes messages in from the internet and
+from other ESP32 nodes over ESP-NOW, keeps the last 15 of them, and passes
+them back out to whichever nodes want them. It also broadcasts the time,
+prayer times and weather so every node can show the same data, and it updates
+its own firmware from this repo's releases.
+
+The Salah clock is what it shows while it is idle.
 
 ## What it shows
 
-**Clock face**
+**Idle face** - the time, centred, and one scrolling line:
 
 ```
- 10:45 PM
- 32
- TUE 22 SEP                      ((•  -58
- 28 C | 52% humidity | Asr 4:12 PM in 1h 12m | 2 new messages | Bengaluru
+        10:45 PM
+              32
+
+ TUE 22 SEP | 28 C | 52% humidity | Asr 4:12 PM in 1h 12m |
+ 2 new messages | Bengaluru | signal -47 dBm
 ```
 
-The big time sits at the top, the date and signal strength share a small row,
-and a single line scrolls along the bottom with temperature, humidity, the
-next prayer, unread messages and your city.
+**Every minute** it slides over to the message queue, cycles through what has
+arrived, and slides back. An empty queue just says `No messages`.
 
-**Every few minutes** three cards slide past, then it returns to the clock:
-
-1. **Next prayer** in large type with a countdown
-2. **Temperature and humidity**
-3. **Message queue**, newest first, cycling
+The next-prayer and weather cards are still there as extra slides, switched
+off by default because the scrolling line already carries both. Turn them on
+under **Screen** in the web panel.
 
 **At prayer time** an alert takes over: a pulsing announcement, then a Quran
 verse. Fajr and Maghrib add a sunrise or sunset animation and a reminder to
