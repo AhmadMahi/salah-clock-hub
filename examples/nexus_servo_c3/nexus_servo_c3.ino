@@ -19,8 +19,10 @@
                      hours, then 8 minutes for ever.
      after manual off, or plain ON, or nothing at all
                      every 10 minutes.
-   Every one of those numbers is editable on the config page, and
-   manual mode replaces the whole thing with one fixed interval.
+   Every one of those numbers is editable on the config page. Manual
+   mode replaces the whole thing with a fixed cycle: awake one minute,
+   asleep one minute, so commands land almost straight away. There is
+   nothing to configure for it.
 
    Nothing published while it sleeps is lost. It connects with a
    PERSISTENT SESSION and a fixed client id, so the broker holds
@@ -90,9 +92,13 @@
 #define DEF_PUB_TOPIC   "nexus/ack"
 #define DEF_CLIENT_ID   "nexus-servo-c3"
 
-#define DEF_MODE        0         // 0 = auto schedule, 1 = one fixed interval
-#define DEF_SLEEP_SEC   600       // manual mode interval, seconds. 0 = never sleep
+#define DEF_MODE        0         // 0 = auto schedule, 1 = manual
 #define DEF_LISTEN_MS   1500      // how long to wait for a queued message
+
+// Manual mode is deliberately fixed and has nothing to configure:
+// awake for a minute so commands land almost at once, asleep for a minute.
+#define MANUAL_AWAKE_SEC 60
+#define MANUAL_SLEEP_SEC 60
 
 // ---- auto schedule, all in minutes unless noted ----
 #define DEF_NORMAL_MIN  10        // idle interval when nothing special is going on
@@ -130,7 +136,7 @@ String cfgWifiSsid, cfgWifiPass;
 String cfgMqttHost, cfgMqttUser, cfgMqttPass;
 int    cfgMqttPort;
 String cfgSubTopic, cfgPubTopic, cfgClientId;
-int    cfgMode, cfgSleepSec, cfgListenMs;
+int    cfgMode, cfgListenMs;
 int    cfgNormalMin, cfgStepLong, cfgStepShort, cfgShortBelow;
 int    cfgD1Min, cfgD1Hours, cfgD2Min, cfgD2Hours, cfgD3Min;
 int    cfgAngleRest, cfgAngleOn, cfgAngleOff;
@@ -149,7 +155,6 @@ void loadSettings() {
   cfgPubTopic = prefs.getString("pub",   DEF_PUB_TOPIC);
   cfgClientId = prefs.getString("cid",   DEF_CLIENT_ID);
   cfgMode     = prefs.getInt   ("mode",  DEF_MODE);
-  cfgSleepSec = prefs.getInt   ("sleep", DEF_SLEEP_SEC);
   cfgListenMs = prefs.getInt   ("listen",DEF_LISTEN_MS);
   cfgNormalMin  = prefs.getInt("nmin",  DEF_NORMAL_MIN);
   cfgStepLong   = prefs.getInt("slong", DEF_STEP_LONG);
@@ -167,7 +172,6 @@ void loadSettings() {
   cfgResetSession = prefs.getBool("rsess", false);
 
   cfgMqttPort  = constrain(cfgMqttPort, 1, 65535);
-  cfgSleepSec  = constrain(cfgSleepSec, 0, 86400);
   cfgListenMs  = constrain(cfgListenMs, 300, 30000);
   cfgAngleRest = constrain(cfgAngleRest, 0, 180);
   cfgAngleOn   = constrain(cfgAngleOn,   0, 180);
@@ -497,13 +501,11 @@ button.ghost{background:transparent;color:var(--fg);border:1px solid var(--line)
   <label><span>Mode</span>
     <select id="mode" onchange="modeUI()">
       <option value="0">Auto - follow the ON timer, then wind down</option>
-      <option value="1">Manual - one fixed interval</option>
+      <option value="1">Manual - awake 1 min, asleep 1 min</option>
     </select>
   </label>
 
-  <div id="manualBox">
-    <label><span>Wake every, seconds (0 = never sleep)</span><input id="sleep" type="number" min="0" max="86400"></label>
-  </div>
+  <p class="hint" id="manualNote">Manual keeps it awake for a minute and asleep for a minute, so commands land almost straight away. Nothing to set.</p>
 
   <div id="autoBox">
     <p class="hint">While an ON timer is running it hops in long steps, then short ones near the end. "ON 37" becomes seven 5s and two 1s.</p>
@@ -560,10 +562,10 @@ button.ghost{background:transparent;color:var(--fg);border:1px solid var(--line)
 </main>
 <script>
 const $=s=>document.getElementById(s);
-const F=['mode','sleep','listen','nmin','slong','sshort','sbelow','d1m','d1h','d2m','d2h','d3m',
+const F=['mode','listen','nmin','slong','sshort','sbelow','d1m','d1h','d2m','d2h','d3m',
          'sub_t','pub_t','cid','arest','aon','aoff','led','wssid','mhost','mport','muser'];
 window.esc = function(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
-window.modeUI = function(){const a=$('mode').value==='0';$('autoBox').style.display=a?'':'none';$('manualBox').style.display=a?'none':''}
+window.modeUI = function(){const a=$('mode').value==='0';$('autoBox').style.display=a?'':'none';$('manualNote').style.display=a?'none':''}
 let filled=false;
  window.load = async function(){
   const s=await (await fetch('/api/cfg',{cache:'no-store'})).json();
@@ -625,7 +627,6 @@ void sendCfg() {
   o += "\"d2m\":" + String(cfgD2Min) + ",";
   o += "\"d2h\":" + String(cfgD2Hours) + ",";
   o += "\"d3m\":" + String(cfgD3Min) + ",";
-  o += "\"sleep\":" + String(cfgSleepSec) + ",";
   o += "\"listen\":" + String(cfgListenMs) + ",";
   o += "\"sub_t\":\"" + cfgSubTopic + "\",";
   o += "\"pub_t\":\"" + cfgPubTopic + "\",";
@@ -658,7 +659,6 @@ void handleSave() {
   String oldSub = cfgSubTopic, oldCid = cfgClientId;
 
   cfgMode      = argInt("mode",   cfgMode, 0, 1);
-  cfgSleepSec  = argInt("sleep",  cfgSleepSec, 0, 86400);
   cfgNormalMin = argInt("nmin",   cfgNormalMin, 1, 1440);
   cfgStepLong  = argInt("slong",  cfgStepLong, 1, 240);
   cfgStepShort = argInt("sshort", cfgStepShort, 1, 240);
@@ -693,7 +693,6 @@ void handleSave() {
   prefs.putString("pub",   cfgPubTopic);
   prefs.putString("cid",   cfgClientId);
   prefs.putInt   ("mode",  cfgMode);
-  prefs.putInt   ("sleep", cfgSleepSec);
   prefs.putInt   ("nmin",  cfgNormalMin);
   prefs.putInt   ("slong", cfgStepLong);
   prefs.putInt   ("sshort",cfgStepShort);
@@ -755,7 +754,7 @@ void enterConfigMode() {
 // How long to sleep next, in seconds, and why.
 // Manual mode ignores all of this and uses the one fixed interval.
 int nextSleepSeconds(String& reason) {
-  if (cfgMode == 1) { reason = "manual"; return cfgSleepSec; }
+  if (cfgMode == 1) { reason = "manual"; return MANUAL_SLEEP_SEC; }
 
   if (rtcState == ST_COUNTDOWN && rtcRemain > 0) {
     // Compare in whole minutes, rounded up. The few seconds each wake
@@ -836,6 +835,21 @@ void doRound() {
     lastCommand = "AUTO OFF";
   }
 
+  // Manual mode simply stays up for a minute, handling whatever turns up
+  // as it turns up, then sleeps for a minute.
+  if (cfgMode == 1) {
+    Serial.printf("manual mode: awake for %d s\n", MANUAL_AWAKE_SEC);
+    unsigned long tm = millis();
+    while (millis() - tm < (unsigned long)MANUAL_AWAKE_SEC * 1000UL) {
+      mqtt.poll();
+      if (configMode) return;             // a CONFIG message arrived, stay up
+      if (!mqtt.connected()) break;       // link dropped, no point waiting it out
+      delay(10);
+    }
+    goToSleep("manual");
+    return;
+  }
+
   unsigned long t0 = millis();
   while (millis() - t0 < (unsigned long)cfgListenMs) {
     mqtt.poll();
@@ -895,11 +909,9 @@ void loop() {
     return;
   }
 
-  // only reached when cfgSleepSec is 0, ie never sleep
-  if (mqttUp && mqtt.connected()) mqtt.poll();
-  else {
-    static unsigned long retry = 0;
-    if (millis() - retry > 10000UL) { retry = millis(); mqttUp = false; doRound(); }
-  }
+  // Only reached if a round returned without sleeping, which means the
+  // link failed. Try the whole round again shortly.
+  static unsigned long retry = 0;
+  if (millis() - retry > 10000UL) { retry = millis(); mqttUp = false; doRound(); }
   delay(5);
 }
