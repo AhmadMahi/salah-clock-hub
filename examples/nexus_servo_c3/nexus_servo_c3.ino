@@ -6,9 +6,21 @@
    broker, announces itself, collects whatever is waiting, acts on
    it, and sleeps again.
 
-     "ON"      servo sweeps rest -> 180 -> rest and stops
-     "OFF"     servo sweeps rest ->   0 -> rest and stops
-     "CONFIG"  stays awake and serves a settings page instead
+     "ON"       servo sweeps rest -> 180 -> rest and stops
+     "ON 37"    same, then turns itself OFF 37 minutes later
+     "OFF"      servo sweeps rest ->   0 -> rest and stops
+     "CONFIG"   stays awake and serves a settings page instead
+
+   HOW IT SLEEPS  (auto mode)
+     counting down   5 minute hops while 5 or more minutes remain,
+                     then 1 minute hops. "ON 37" becomes seven 5s and
+                     two 1s, then it turns itself off.
+     after auto off  20 minutes for 5 hours, then 10 minutes for 5
+                     hours, then 8 minutes for ever.
+     after manual off, or plain ON, or nothing at all
+                     every 10 minutes.
+   Every one of those numbers is editable on the config page, and
+   manual mode replaces the whole thing with one fixed interval.
 
    Nothing published while it sleeps is lost. It connects with a
    PERSISTENT SESSION and a fixed client id, so the broker holds
@@ -78,8 +90,20 @@
 #define DEF_PUB_TOPIC   "nexus/ack"
 #define DEF_CLIENT_ID   "nexus-servo-c3"
 
-#define DEF_SLEEP_SEC   60        // 0 keeps it awake all the time
+#define DEF_MODE        0         // 0 = auto schedule, 1 = one fixed interval
+#define DEF_SLEEP_SEC   600       // manual mode interval, seconds. 0 = never sleep
 #define DEF_LISTEN_MS   1500      // how long to wait for a queued message
+
+// ---- auto schedule, all in minutes unless noted ----
+#define DEF_NORMAL_MIN  10        // idle interval when nothing special is going on
+#define DEF_STEP_LONG   5         // hop size while plenty of time remains
+#define DEF_STEP_SHORT  1         // hop size near the end
+#define DEF_SHORT_BELOW 5         // switch to short hops below this many minutes
+#define DEF_D1_MIN      20        // after an automatic off: first tier
+#define DEF_D1_HOURS    5
+#define DEF_D2_MIN      10        // second tier
+#define DEF_D2_HOURS    5
+#define DEF_D3_MIN      8         // and this one for ever
 #define DEF_ANGLE_REST  90
 #define DEF_ANGLE_ON    180
 #define DEF_ANGLE_OFF   0
@@ -106,7 +130,9 @@ String cfgWifiSsid, cfgWifiPass;
 String cfgMqttHost, cfgMqttUser, cfgMqttPass;
 int    cfgMqttPort;
 String cfgSubTopic, cfgPubTopic, cfgClientId;
-int    cfgSleepSec, cfgListenMs;
+int    cfgMode, cfgSleepSec, cfgListenMs;
+int    cfgNormalMin, cfgStepLong, cfgStepShort, cfgShortBelow;
+int    cfgD1Min, cfgD1Hours, cfgD2Min, cfgD2Hours, cfgD3Min;
 int    cfgAngleRest, cfgAngleOn, cfgAngleOff;
 int    cfgLedBright;
 bool   cfgResetSession;           // clear stale subscriptions once after a topic change
@@ -122,8 +148,18 @@ void loadSettings() {
   cfgSubTopic = prefs.getString("sub",   DEF_SUB_TOPIC);
   cfgPubTopic = prefs.getString("pub",   DEF_PUB_TOPIC);
   cfgClientId = prefs.getString("cid",   DEF_CLIENT_ID);
+  cfgMode     = prefs.getInt   ("mode",  DEF_MODE);
   cfgSleepSec = prefs.getInt   ("sleep", DEF_SLEEP_SEC);
   cfgListenMs = prefs.getInt   ("listen",DEF_LISTEN_MS);
+  cfgNormalMin  = prefs.getInt("nmin",  DEF_NORMAL_MIN);
+  cfgStepLong   = prefs.getInt("slong", DEF_STEP_LONG);
+  cfgStepShort  = prefs.getInt("sshort",DEF_STEP_SHORT);
+  cfgShortBelow = prefs.getInt("sbelow",DEF_SHORT_BELOW);
+  cfgD1Min      = prefs.getInt("d1m",   DEF_D1_MIN);
+  cfgD1Hours    = prefs.getInt("d1h",   DEF_D1_HOURS);
+  cfgD2Min      = prefs.getInt("d2m",   DEF_D2_MIN);
+  cfgD2Hours    = prefs.getInt("d2h",   DEF_D2_HOURS);
+  cfgD3Min      = prefs.getInt("d3m",   DEF_D3_MIN);
   cfgAngleRest= prefs.getInt   ("arest", DEF_ANGLE_REST);
   cfgAngleOn  = prefs.getInt   ("aon",   DEF_ANGLE_ON);
   cfgAngleOff = prefs.getInt   ("aoff",  DEF_ANGLE_OFF);
@@ -137,6 +173,16 @@ void loadSettings() {
   cfgAngleOn   = constrain(cfgAngleOn,   0, 180);
   cfgAngleOff  = constrain(cfgAngleOff,  0, 180);
   cfgLedBright = constrain(cfgLedBright, 1, 255);
+  cfgMode       = constrain(cfgMode, 0, 1);
+  cfgNormalMin  = constrain(cfgNormalMin, 1, 1440);
+  cfgStepLong   = constrain(cfgStepLong, 1, 240);
+  cfgStepShort  = constrain(cfgStepShort, 1, 240);
+  cfgShortBelow = constrain(cfgShortBelow, 1, 240);
+  cfgD1Min      = constrain(cfgD1Min, 1, 1440);
+  cfgD2Min      = constrain(cfgD2Min, 1, 1440);
+  cfgD3Min      = constrain(cfgD3Min, 1, 1440);
+  cfgD1Hours    = constrain(cfgD1Hours, 0, 240);
+  cfgD2Hours    = constrain(cfgD2Hours, 0, 240);
   if (cfgSubTopic.length() == 0) cfgSubTopic = DEF_SUB_TOPIC;
   if (cfgPubTopic.length() == 0) cfgPubTopic = DEF_PUB_TOPIC;
   if (cfgClientId.length() == 0) cfgClientId = DEF_CLIENT_ID;
@@ -154,7 +200,21 @@ bool     gotAnything = false;
 int      currentAngle = DEF_ANGLE_REST;
 String   lastCommand  = "none";
 
-RTC_DATA_ATTR uint32_t wakeCount = 0;      // survives deep sleep
+// ---- state that has to survive deep sleep ----
+enum { ST_NORMAL = 0, ST_COUNTDOWN = 1, ST_DECAY = 2 };
+
+RTC_DATA_ATTR uint32_t wakeCount   = 0;
+RTC_DATA_ATTR int      rtcState    = ST_NORMAL;
+RTC_DATA_ATTR int32_t  rtcRemain   = 0;    // seconds left before the automatic off
+RTC_DATA_ATTR int32_t  rtcSinceOff = 0;    // seconds since that automatic off
+
+const char* stateName() {
+  switch (rtcState) {
+    case ST_COUNTDOWN: return "countdown";
+    case ST_DECAY:     return "decay";
+    default:           return "normal";
+  }
+}
 
 // ================================================================
 //  RGB LED
@@ -243,6 +303,8 @@ void say(const String& event, const String& extra) {
   if (!mqttUp) return;
   String body = String("{\"node\":\"") + cfgClientId + "\",\"event\":\"" + event +
                 "\",\"wake\":" + String(wakeCount) +
+                ",\"state\":\"" + stateName() + "\"" +
+                ",\"remain_min\":" + String((rtcRemain + 59) / 60) +
                 ",\"angle\":" + String(currentAngle);
   if (extra.length()) body += "," + extra;
   body += "}";
@@ -256,37 +318,66 @@ void say(const String& event, const String& extra) {
 
 void enterConfigMode();                                // forward
 
+// Turn the servo on or off and remember which way it is
+void servoOn()  { rgb(0, 255, 0); servoRun(cfgAngleOn);  flash(0, 255, 0, 2, 90); rgbOff(); }
+void servoOff() { rgb(255, 0, 0); servoRun(cfgAngleOff); flash(255, 0, 0, 2, 90); rgbOff(); }
+
+// "ON 37" -> verb "ON", minutes 37.  "ON37", "ON  37" and "ON=37" work too.
+void parseCommand(const String& in, String& verb, long& minutes) {
+  verb = "";
+  minutes = 0;
+  int i = 0;
+  while (i < (int)in.length() && isAlpha(in.charAt(i))) verb += in.charAt(i++);
+  while (i < (int)in.length() && !isDigit(in.charAt(i))) i++;
+  if (i < (int)in.length()) minutes = in.substring(i).toInt();
+}
+
 void handleCommand(const String& raw) {
   String cmd = raw;
   cmd.trim();
   cmd.toUpperCase();
   lastCommand = cmd;
 
-  if (cmd.startsWith("CONFIG")) {
+  String verb;
+  long minutes = 0;
+  parseCommand(cmd, verb, minutes);
+
+  if (verb.startsWith("CONFIG")) {
     enterConfigMode();
     return;
   }
 
   say("received", "\"msg\":\"" + cmd + "\"");
 
-  if (cmd == "ON") {
-    Serial.println("command ON");
-    rgb(0, 255, 0);
-    servoRun(cfgAngleOn);
-    say("done", "\"cmd\":\"ON\"");
-    flash(0, 255, 0, 2, 90);
-  } else if (cmd == "OFF") {
-    Serial.println("command OFF");
-    rgb(255, 0, 0);
-    servoRun(cfgAngleOff);
-    say("done", "\"cmd\":\"OFF\"");
-    flash(255, 0, 0, 2, 90);
+  if (verb == "ON") {
+    if (minutes > 0) {
+      // run for this long, then turn myself off
+      rtcState  = ST_COUNTDOWN;
+      rtcRemain = (int32_t)minutes * 60;
+      Serial.printf("ON for %ld minutes\n", minutes);
+      servoOn();
+      say("on", "\"for_min\":" + String(minutes) + ",\"until_sec\":" + String(rtcRemain));
+    } else {
+      rtcState  = ST_NORMAL;      // plain ON, no timer
+      rtcRemain = 0;
+      Serial.println("ON (no timer)");
+      servoOn();
+      say("on", "\"for_min\":0");
+    }
+  } else if (verb == "OFF") {
+    // a hand sent OFF cancels any countdown and goes back to the plain interval
+    bool wasCounting = (rtcState == ST_COUNTDOWN);
+    rtcState  = ST_NORMAL;
+    rtcRemain = 0;
+    Serial.println(wasCounting ? "OFF (countdown cancelled)" : "OFF");
+    servoOff();
+    say("off", String("\"by\":\"manual\",\"cancelled\":") + (wasCounting ? "true" : "false"));
   } else {
     Serial.println("message (not a command): " + cmd);
     say("ignored", "\"msg\":\"" + cmd + "\"");
     flash(120, 120, 120, 1, 120);
+    rgbOff();
   }
-  rgbOff();
 }
 
 void onMqttMessage(int size) {
@@ -382,7 +473,7 @@ h2{font-size:16px;margin:20px 0 6px}
 .grid span:nth-child(odd){color:var(--muted)}
 .grid span:nth-child(even){text-align:right;font-variant-numeric:tabular-nums;word-break:break-all}
 label span{display:block;font-size:13px;color:var(--muted);margin:10px 0 4px}
-input{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);font:inherit}
+input,select{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);font:inherit}
 .two{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 button{font:inherit;font-weight:600;padding:12px 16px;border:0;border-radius:8px;background:var(--acc);color:var(--accfg);cursor:pointer;width:100%;margin-top:14px}
 button.ghost{background:transparent;color:var(--fg);border:1px solid var(--line)}
@@ -402,8 +493,38 @@ button.ghost{background:transparent;color:var(--fg);border:1px solid var(--line)
     <button class="ghost" onclick="test('rest')">Go to rest</button>
   </div>
 
-  <h2>Timing</h2>
-  <label><span>Sleep between wakes, seconds (0 = never sleep)</span><input id="sleep" type="number" min="0" max="86400"></label>
+  <h2>Wake schedule</h2>
+  <label><span>Mode</span>
+    <select id="mode" onchange="modeUI()">
+      <option value="0">Auto - follow the ON timer, then wind down</option>
+      <option value="1">Manual - one fixed interval</option>
+    </select>
+  </label>
+
+  <div id="manualBox">
+    <label><span>Wake every, seconds (0 = never sleep)</span><input id="sleep" type="number" min="0" max="86400"></label>
+  </div>
+
+  <div id="autoBox">
+    <p class="hint">While an ON timer is running it hops in long steps, then short ones near the end. "ON 37" becomes seven 5s and two 1s.</p>
+    <div class="two">
+      <label><span>Long hop, min</span><input id="slong" type="number" min="1" max="240"></label>
+      <label><span>Short hop, min</span><input id="sshort" type="number" min="1" max="240"></label>
+    </div>
+    <label><span>Use short hops below, min</span><input id="sbelow" type="number" min="1" max="240"></label>
+    <p class="hint">After the timer turns it off by itself, the interval winds down through these tiers.</p>
+    <div class="two">
+      <label><span>Tier 1, min</span><input id="d1m" type="number" min="1" max="1440"></label>
+      <label><span>for, hours</span><input id="d1h" type="number" min="0" max="240"></label>
+    </div>
+    <div class="two">
+      <label><span>Tier 2, min</span><input id="d2m" type="number" min="1" max="1440"></label>
+      <label><span>for, hours</span><input id="d2h" type="number" min="0" max="240"></label>
+    </div>
+    <label><span>Then for ever, min</span><input id="d3m" type="number" min="1" max="1440"></label>
+    <label><span>Idle interval otherwise, min</span><input id="nmin" type="number" min="1" max="1440"></label>
+  </div>
+
   <label><span>Listen window each wake, ms</span><input id="listen" type="number" min="300" max="30000"></label>
 
   <h2>Topics</h2>
@@ -439,11 +560,14 @@ button.ghost{background:transparent;color:var(--fg);border:1px solid var(--line)
 </main>
 <script>
 const $=s=>document.getElementById(s);
-const F=['sleep','listen','sub_t','pub_t','cid','arest','aon','aoff','led','wssid','mhost','mport','muser'];
+const F=['mode','sleep','listen','nmin','slong','sshort','sbelow','d1m','d1h','d2m','d2h','d3m',
+         'sub_t','pub_t','cid','arest','aon','aoff','led','wssid','mhost','mport','muser'];
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function modeUI(){const a=$('mode').value==='0';$('autoBox').style.display=a?'':'none';$('manualBox').style.display=a?'none':''}
 async function load(){
   const s=await (await fetch('/api/cfg',{cache:'no-store'})).json();
   F.forEach(k=>{if(s[k]!==undefined)$(k).value=s[k]});
+  modeUI();
   $('sub').textContent='config mode  ·  '+s.ip;
   const rows={'IP':s.ip,'MAC':s.mac,'Signal':s.rssi+' dBm','Wakes':s.wake,
               'Servo angle':s.angle+'°','Last command':s.last,
@@ -465,6 +589,8 @@ load();setInterval(load,5000);
 </script></body></html>
 )HTML";
 
+int nextSleepSeconds(String& reason);   // defined below
+
 void sendCfg() {
   String o = "{";
   o += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
@@ -475,6 +601,20 @@ void sendCfg() {
   o += "\"last\":\"" + lastCommand + "\",";
   o += "\"mqtt\":" + String(mqttUp ? "true" : "false") + ",";
   o += "\"up\":" + String(millis() / 1000UL) + ",";
+  o += "\"state\":\"" + String(stateName()) + "\",";
+  o += "\"remain\":" + String((rtcRemain + 59) / 60) + ",";
+  { String r; o += "\"next_min\":" + String(nextSleepSeconds(r) / 60) + ",";
+              o += "\"sched\":\"" + r + "\","; }
+  o += "\"mode\":" + String(cfgMode) + ",";
+  o += "\"nmin\":" + String(cfgNormalMin) + ",";
+  o += "\"slong\":" + String(cfgStepLong) + ",";
+  o += "\"sshort\":" + String(cfgStepShort) + ",";
+  o += "\"sbelow\":" + String(cfgShortBelow) + ",";
+  o += "\"d1m\":" + String(cfgD1Min) + ",";
+  o += "\"d1h\":" + String(cfgD1Hours) + ",";
+  o += "\"d2m\":" + String(cfgD2Min) + ",";
+  o += "\"d2h\":" + String(cfgD2Hours) + ",";
+  o += "\"d3m\":" + String(cfgD3Min) + ",";
   o += "\"sleep\":" + String(cfgSleepSec) + ",";
   o += "\"listen\":" + String(cfgListenMs) + ",";
   o += "\"sub_t\":\"" + cfgSubTopic + "\",";
@@ -507,7 +647,17 @@ String argStr(const char* k, const String& cur, int maxLen) {
 void handleSave() {
   String oldSub = cfgSubTopic, oldCid = cfgClientId;
 
+  cfgMode      = argInt("mode",   cfgMode, 0, 1);
   cfgSleepSec  = argInt("sleep",  cfgSleepSec, 0, 86400);
+  cfgNormalMin = argInt("nmin",   cfgNormalMin, 1, 1440);
+  cfgStepLong  = argInt("slong",  cfgStepLong, 1, 240);
+  cfgStepShort = argInt("sshort", cfgStepShort, 1, 240);
+  cfgShortBelow= argInt("sbelow", cfgShortBelow, 1, 240);
+  cfgD1Min     = argInt("d1m",    cfgD1Min, 1, 1440);
+  cfgD1Hours   = argInt("d1h",    cfgD1Hours, 0, 240);
+  cfgD2Min     = argInt("d2m",    cfgD2Min, 1, 1440);
+  cfgD2Hours   = argInt("d2h",    cfgD2Hours, 0, 240);
+  cfgD3Min     = argInt("d3m",    cfgD3Min, 1, 1440);
   cfgListenMs  = argInt("listen", cfgListenMs, 300, 30000);
   cfgSubTopic  = argStr("sub_t",  cfgSubTopic, 80);
   cfgPubTopic  = argStr("pub_t",  cfgPubTopic, 80);
@@ -532,7 +682,17 @@ void handleSave() {
   prefs.putString("sub",   cfgSubTopic);
   prefs.putString("pub",   cfgPubTopic);
   prefs.putString("cid",   cfgClientId);
+  prefs.putInt   ("mode",  cfgMode);
   prefs.putInt   ("sleep", cfgSleepSec);
+  prefs.putInt   ("nmin",  cfgNormalMin);
+  prefs.putInt   ("slong", cfgStepLong);
+  prefs.putInt   ("sshort",cfgStepShort);
+  prefs.putInt   ("sbelow",cfgShortBelow);
+  prefs.putInt   ("d1m",   cfgD1Min);
+  prefs.putInt   ("d1h",   cfgD1Hours);
+  prefs.putInt   ("d2m",   cfgD2Min);
+  prefs.putInt   ("d2h",   cfgD2Hours);
+  prefs.putInt   ("d3m",   cfgD3Min);
   prefs.putInt   ("listen",cfgListenMs);
   prefs.putInt   ("arest", cfgAngleRest);
   prefs.putInt   ("aon",   cfgAngleOn);
@@ -582,15 +742,58 @@ void enterConfigMode() {
 //  THE NORMAL ROUND
 // ================================================================
 
+// How long to sleep next, in seconds, and why.
+// Manual mode ignores all of this and uses the one fixed interval.
+int nextSleepSeconds(String& reason) {
+  if (cfgMode == 1) { reason = "manual"; return cfgSleepSec; }
+
+  if (rtcState == ST_COUNTDOWN && rtcRemain > 0) {
+    // Compare in whole minutes, rounded up. The few seconds each wake
+    // costs would otherwise drop "10 minutes left" to 4:55 and kick us
+    // into short hops a whole step early.
+    int32_t remainMin = (rtcRemain + 59) / 60;
+    if (remainMin >= (int32_t)cfgShortBelow) {
+      reason = "countdown-long";
+      return cfgStepLong * 60;
+    }
+    reason = "countdown-short";
+    return cfgStepShort * 60;
+  }
+
+  if (rtcState == ST_DECAY) {
+    int32_t t1 = (int32_t)cfgD1Hours * 3600;
+    int32_t t2 = t1 + (int32_t)cfgD2Hours * 3600;
+    if (rtcSinceOff < t1) { reason = "decay-1"; return cfgD1Min * 60; }
+    if (rtcSinceOff < t2) { reason = "decay-2"; return cfgD2Min * 60; }
+    reason = "decay-3";
+    return cfgD3Min * 60;
+  }
+
+  reason = "normal";
+  return cfgNormalMin * 60;
+}
+
 void goToSleep(const char* why) {
-  if (cfgSleepSec == 0) {                 // configured to stay awake
+  String reason;
+  int sleepSec = nextSleepSeconds(reason);
+
+  if (sleepSec <= 0) {                    // configured never to sleep
     Serial.printf("staying awake (%s)\n", why);
     return;
   }
-  Serial.printf("sleeping %d s (%s)\n\n", cfgSleepSec, why);
+
+  // Charge this round's awake time plus the sleep we are about to take
+  // against whichever clock is running, so the totals track real time.
+  int32_t spent = (int32_t)(millis() / 1000UL) + sleepSec;
+  if      (rtcState == ST_COUNTDOWN) rtcRemain   -= spent;
+  else if (rtcState == ST_DECAY)     rtcSinceOff += spent;
+
+  Serial.printf("sleeping %d s (%s, %s), state %s, %d s left\n\n",
+                sleepSec, why, reason.c_str(), stateName(), (int)rtcRemain);
 
   if (mqttUp) {
-    say("sleep", String("\"sec\":") + String(cfgSleepSec) + ",\"why\":\"" + why + "\"");
+    say("sleep", String("\"sec\":") + String(sleepSec) +
+                 ",\"why\":\"" + why + "\",\"sched\":\"" + reason + "\"");
     delay(150);
     mqtt.stop();
   }
@@ -599,7 +802,7 @@ void goToSleep(const char* why) {
   WiFi.mode(WIFI_OFF);
   Serial.flush();
 
-  esp_sleep_enable_timer_wakeup((uint64_t)cfgSleepSec * 1000000ULL);
+  esp_sleep_enable_timer_wakeup((uint64_t)sleepSec * 1000000ULL);
   esp_deep_sleep_start();
 }
 
@@ -610,6 +813,18 @@ void doRound() {
   if (!mqttConnect())      { breathe(200, 0, 0, 700); goToSleep("no broker"); return; }
 
   say("wake", "");
+
+  // The timer ran out while we were asleep: turn off by ourselves and
+  // start the decaying idle schedule.
+  if (rtcState == ST_COUNTDOWN && rtcRemain <= 0) {
+    Serial.println("countdown finished, turning off");
+    rtcState    = ST_DECAY;
+    rtcRemain   = 0;
+    rtcSinceOff = 0;
+    servoOff();
+    say("off", "\"by\":\"timer\"");
+    lastCommand = "AUTO OFF";
+  }
 
   unsigned long t0 = millis();
   while (millis() - t0 < (unsigned long)cfgListenMs) {
