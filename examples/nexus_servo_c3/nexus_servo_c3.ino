@@ -31,10 +31,13 @@
      red bright ........ OFF, servo sweeping down
      red breathing ..... lost the network or the broker
 
-   LIBRARIES
-     ArduinoMqttClient   (Library Manager)
-     Nothing else. The servo is driven straight from LEDC, so no
-     servo library is required.
+   LIBRARIES (Library Manager)
+     ArduinoMqttClient
+     ESP32Servo
+
+   The RGB LED is driven through ESP32Servo's own PWM class rather
+   than the core LEDC calls, so the servo and the LED cannot end up
+   fighting over the same hardware timer.
 
    Board: any ESP32-C3 board, ESP32 Arduino core 2.x or 3.x
   ================================================================
@@ -44,6 +47,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <ArduinoMqttClient.h>
+#include <ESP32Servo.h>
 
 // ================================================================
 //  CONFIGURATION  -  everything you need to change is here
@@ -65,6 +69,9 @@ const char* CLIENT_ID = "nexus-servo-c3";      // must differ from every other c
 #define LED_GND     6                          // held LOW, this is the LED's ground
 #define LED_G       7
 #define LED_B       8
+
+// ---- LED brightness, 0 to 255. Deliberately low; raise it if you want. ----
+#define LED_BRIGHT  20
 
 // ---- servo travel ----
 #define ANGLE_REST  90
@@ -89,31 +96,34 @@ int           currentAngle = ANGLE_REST;
 // ================================================================
 //  RGB LED
 // ================================================================
+//  Colours below are written as normal 0-255 values and then scaled
+//  down by LED_BRIGHT, so one knob dims everything at once.
 
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
-  #define LED_ATTACH(pin)      ledcAttach(pin, 5000, 8)
-  #define LED_WRITE(pin, duty) ledcWrite(pin, duty)
-#else
-  static int _ledCh = 0;
-  #define LED_ATTACH(pin)      do { ledcSetup(_ledCh, 5000, 8); ledcAttachPin(pin, _ledCh); _ledCh++; } while (0)
-  #define LED_WRITE(pin, duty) ledcWrite(pin == LED_R ? 0 : (pin == LED_G ? 1 : 2), duty)
-#endif
+ESP32PWM pwmR, pwmG, pwmB;
+
+uint8_t dimmed(uint8_t v) {
+  return (uint8_t)(((uint16_t)v * LED_BRIGHT) / 255);
+}
 
 void ledBegin() {
   pinMode(LED_GND, OUTPUT);
   digitalWrite(LED_GND, LOW);          // this pin is the LED's ground
-  LED_ATTACH(LED_R);
-  LED_ATTACH(LED_G);
-  LED_ATTACH(LED_B);
+  pwmR.attachPin(LED_R, 5000, 8);
+  pwmG.attachPin(LED_G, 5000, 8);
+  pwmB.attachPin(LED_B, 5000, 8);
 }
 
 void rgb(uint8_t r, uint8_t g, uint8_t b) {
-  LED_WRITE(LED_R, r);
-  LED_WRITE(LED_G, g);
-  LED_WRITE(LED_B, b);
+  pwmR.write(dimmed(r));
+  pwmG.write(dimmed(g));
+  pwmB.write(dimmed(b));
 }
 
-void rgbOff() { rgb(0, 0, 0); }
+void rgbOff() {
+  pwmR.write(0);
+  pwmG.write(0);
+  pwmB.write(0);
+}
 
 // one breath in and out, used while we are waiting for something
 void breathe(uint8_t r, uint8_t g, uint8_t b, int ms) {
@@ -135,33 +145,18 @@ void flash(uint8_t r, uint8_t g, uint8_t b, int times, int ms) {
   }
 }
 
-// what the LED sits at when nothing is happening
-void ledIdle() { rgb(0, 24, 0); }                        // dim green: listening
+// what the LED sits at when nothing is happening: a faint green glow
+void ledIdle() { rgb(0, 70, 0); }
 
 // ================================================================
-//  SERVO, driven straight from LEDC
+//  SERVO  (ESP32Servo)
 // ================================================================
-//  50 Hz, 16 bit. A 0.5 ms pulse is 0 degrees, 2.5 ms is 180.
 
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
-  #define SERVO_ATTACH()      ledcAttach(SERVO_PIN, 50, 16)
-  #define SERVO_WRITE(duty)   ledcWrite(SERVO_PIN, duty)
-  #define SERVO_DETACH()      ledcDetach(SERVO_PIN)
-#else
-  #define SERVO_CH 3
-  #define SERVO_ATTACH()      do { ledcSetup(SERVO_CH, 50, 16); ledcAttachPin(SERVO_PIN, SERVO_CH); } while (0)
-  #define SERVO_WRITE(duty)   ledcWrite(SERVO_CH, duty)
-  #define SERVO_DETACH()      ledcDetachPin(SERVO_PIN)
-#endif
-
-uint32_t angleToDuty(int deg) {
-  deg = constrain(deg, 0, 180);
-  int us = map(deg, 0, 180, 500, 2500);               // pulse width in microseconds
-  return (uint32_t)((uint64_t)us * 65536ULL / 20000ULL);  // 20 ms period
-}
+Servo servo;
 
 void servoGoto(int deg) {
-  SERVO_WRITE(angleToDuty(deg));
+  deg = constrain(deg, 0, 180);
+  servo.write(deg);
   currentAngle = deg;
 }
 
@@ -173,24 +168,28 @@ void servoSweep(int target) {
     delay(SWEEP_DELAY);
   }
   servoGoto(target);
-  delay(120);
+  delay(150);
 }
 
 void servoBegin() {
-  SERVO_ATTACH();
-  servoGoto(ANGLE_REST);              // rest at 90 the moment we power up
-  delay(600);
-  SERVO_DETACH();                     // stop the pulses so it does not buzz
+  servo.setPeriodHertz(50);
+  servo.attach(SERVO_PIN, 500, 2500);   // 0.5 ms to 2.5 ms covers 0 to 180
+  servo.write(ANGLE_REST);              // rest at 90 the moment we power up
+  currentAngle = ANGLE_REST;
+  delay(700);
+  servo.detach();                       // stop the pulses so it does not buzz
 }
 
 // Out to the target, back to rest, then stop driving it
 void servoRun(int target) {
-  SERVO_ATTACH();
-  servoGoto(currentAngle);            // re-assert where we are before moving
-  delay(60);
+  servo.setPeriodHertz(50);
+  servo.attach(SERVO_PIN, 500, 2500);
+  servo.write(currentAngle);            // re-assert where we are before moving
+  delay(80);
   servoSweep(target);
   servoSweep(ANGLE_REST);
-  SERVO_DETACH();                     // parked at 90 and quiet
+  delay(150);
+  servo.detach();                       // parked at 90 and quiet
 }
 
 // ================================================================
@@ -311,6 +310,13 @@ void setup() {
   Serial.begin(115200);
   delay(300);
   Serial.println("\n=== NEXUS servo node ===");
+
+  // hand every LEDC timer to the ESP32Servo library, which then shares
+  // them between the servo and the three LED channels
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
 
   ledBegin();
   flash(60, 60, 60, 1, 150);                         // brief white: alive
