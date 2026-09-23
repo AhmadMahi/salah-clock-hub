@@ -562,10 +562,10 @@ button.ghost{background:transparent;color:var(--fg);border:1px solid var(--line)
 const $=s=>document.getElementById(s);
 const F=['mode','sleep','listen','nmin','slong','sshort','sbelow','d1m','d1h','d2m','d2h','d3m',
          'sub_t','pub_t','cid','arest','aon','aoff','led','wssid','mhost','mport','muser'];
-function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
-function modeUI(){const a=$('mode').value==='0';$('autoBox').style.display=a?'':'none';$('manualBox').style.display=a?'none':''}
+window.esc = function(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+window.modeUI = function(){const a=$('mode').value==='0';$('autoBox').style.display=a?'':'none';$('manualBox').style.display=a?'none':''}
 let filled=false;
-async function load(){
+ window.load = async function(){
   const s=await (await fetch('/api/cfg',{cache:'no-store'})).json();
   // Fill the form ONCE. Refilling on every poll would overwrite whatever
   // you are in the middle of changing, a second after you change it.
@@ -583,9 +583,9 @@ async function load(){
               'Broker':s.mqtt?'connected':'not connected','Uptime':s.up+' s'};
   $('st').innerHTML=Object.entries(rows).map(([k,v])=>'<span>'+k+'</span><span>'+esc(v)+'</span>').join('');
 }
-async function post(u,d){return fetch(u,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(d||{})})}
-async function test(w){$('msg').textContent='moving...';await post('/api/test',{w:w});$('msg').textContent='done';load()}
-async function save(){
+ window.post = async function(u,d){return fetch(u,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(d||{})})}
+ window.test = async function(w){$('msg').textContent='moving...';await post('/api/test',{w:w});$('msg').textContent='done';load()}
+ window.save = async function(){
   const d={};F.forEach(k=>d[k]=$(k).value);
   if($('wpass').value)d.wpass=$('wpass').value;
   if($('mpass').value)d.mpass=$('mpass').value;
@@ -594,7 +594,7 @@ async function save(){
   filled=false;                    // re-read the saved values if we are still up
   $('msg').textContent='Saved. Rebooting into the normal sleep cycle.';
 }
-async function reboot(){await post('/api/reboot',{});$('msg').textContent='Rebooting.'}
+ window.reboot = async function(){await post('/api/reboot',{});$('msg').textContent='Rebooting.'}
 load();setInterval(load,5000);
 </script></body></html>
 )HTML";
