@@ -2,14 +2,21 @@
   ================================================================
    NEXUS SERVO NODE  -  ESP32-C3 + servo + RGB LED, over WiFi/MQTT
   ================================================================
-   Joins your WiFi, connects to the same MQTT broker as the hub, and
-   listens on the same message topic.
+   EACH WAKE it joins WiFi, connects to the broker, announces itself,
+   collects anything waiting for it, acts on it, and goes back to sleep.
 
      payload "ON"   servo sweeps 90 -> 180 -> 90 and stops
      payload "OFF"  servo sweeps 90 ->   0 -> 90 and stops
 
-   It rests at 90 degrees and holds there. The RGB LED shows what is
-   happening at a glance.
+   Nothing published while it sleeps is lost. It connects with a
+   PERSISTENT SESSION and a fixed client id, so the broker holds QoS 1
+   messages for it and hands them over the moment it reconnects.
+
+   >> PUBLISH WITH QoS 1. <<  A QoS 0 message is dropped for an offline
+   client, so it would only ever arrive if the node happened to be awake.
+
+   It rests at 90 degrees. The RGB LED shows what is happening at a
+   glance, and everything it does is reported on the ack topic.
 
    WIRING
      Servo signal .......... GPIO 4     (servo V+ to 5V, GND to GND)
@@ -22,14 +29,16 @@
    below - module pinouts vary.
 
    COLOURS
+     white blip ........ awake
      blue breathing .... joining WiFi
      cyan flash ........ WiFi joined
      yellow ............ connecting to the broker
-     green dim ......... subscribed and idle, waiting for commands
+     green flash ....... subscribed, listening for anything queued
      white flash ....... a message arrived
      green bright ...... ON, servo sweeping up
      red bright ........ OFF, servo sweeping down
-     red breathing ..... lost the network or the broker
+     blue blip ......... nothing waiting, going straight back to sleep
+     red breathing ..... could not reach the network or the broker
 
    LIBRARIES (Library Manager)
      ArduinoMqttClient
@@ -61,7 +70,16 @@ const int   MQTT_PORT = 8883;
 const char* MQTT_USER = "YOUR_MQTT_USER";       // needs subscribe AND publish
 const char* MQTT_PASS = "YOUR_MQTT_PASSWORD";
 const char* MQTT_BASE = "nexus";               // same prefix as the hub
-const char* CLIENT_ID = "nexus-servo-c3";      // must differ from every other client
+const char* CLIENT_ID = "nexus-servo-c3";      // fixed: the broker queues against it
+
+// ---- sleep cycle ----
+// Seconds of deep sleep between wakes. Set to 0 to stay awake instead.
+#define SLEEP_SECONDS      60
+
+// How long to listen for queued messages before giving up and sleeping.
+#define WAIT_FOR_MSG_MS    1500
+// Once something has arrived, how long to keep listening for more.
+#define WAIT_FOR_MORE_MS   700
 
 // ---- pins ----
 #define SERVO_PIN   4
@@ -87,11 +105,12 @@ MqttClient       mqtt(net);
 
 String topicSub()   { return String(MQTT_BASE) + "/msg"; }
 String topicSubAll(){ return String(MQTT_BASE) + "/msg/#"; }
-String topicPub()   { return String(MQTT_BASE) + "/servo"; }
+String topicAck()   { return String(MQTT_BASE) + "/ack"; }
 
-bool          mqttUp       = false;
-unsigned long nextMqttTry  = 0;
-int           currentAngle = ANGLE_REST;
+bool     mqttUp       = false;
+int      currentAngle = ANGLE_REST;
+bool     gotAnything  = false;        // did anything arrive this wake?
+RTC_DATA_ATTR uint32_t wakeCount = 0; // survives deep sleep
 
 // ================================================================
 //  RGB LED
@@ -196,15 +215,20 @@ void servoRun(int target) {
 //  MQTT
 // ================================================================
 
-void publishState(const char* cmd, const char* state) {
+// Everything this node has to say goes to the ack topic
+void say(const String& event, const String& extra) {
   if (!mqttUp) return;
-  String body = String("{\"node\":\"") + CLIENT_ID + "\",\"cmd\":\"" + cmd +
-                "\",\"angle\":" + String(currentAngle) + ",\"state\":\"" + state + "\"}";
-  if (mqtt.beginMessage(topicPub())) {
+  String body = String("{\"node\":\"") + CLIENT_ID + "\",\"event\":\"" + event +
+                "\",\"wake\":" + String(wakeCount) +
+                ",\"angle\":" + String(currentAngle);
+  if (extra.length()) body += "," + extra;
+  body += "}";
+
+  if (mqtt.beginMessage(topicAck(), false, 1)) {   // QoS 1 so it is not lost
     mqtt.print(body);
     mqtt.endMessage();
   }
-  Serial.println("pub " + topicPub() + " " + body);
+  Serial.println("ack " + body);
 }
 
 void handleCommand(const String& raw) {
@@ -212,25 +236,27 @@ void handleCommand(const String& raw) {
   cmd.trim();
   cmd.toUpperCase();
 
+  // tell the broker we have it, before we start moving
+  say("received", "\"msg\":\"" + cmd + "\"");
+
   if (cmd == "ON") {
     Serial.println("command ON  -> 90 to 180 and back");
-    rgb(0, 255, 0);                                  // bright green while moving
-    publishState("ON", "moving");
+    rgb(0, 255, 0);
     servoRun(ANGLE_ON);
-    publishState("ON", "done");
+    say("done", "\"cmd\":\"ON\"");
     flash(0, 255, 0, 2, 90);
   } else if (cmd == "OFF") {
     Serial.println("command OFF -> 90 to 0 and back");
-    rgb(255, 0, 0);                                  // bright red while moving
-    publishState("OFF", "moving");
+    rgb(255, 0, 0);
     servoRun(ANGLE_OFF);
-    publishState("OFF", "done");
+    say("done", "\"cmd\":\"OFF\"");
     flash(255, 0, 0, 2, 90);
   } else {
     Serial.println("message (not a command): " + cmd);
-    flash(120, 120, 120, 1, 120);                    // white blip, nothing to do
+    say("ignored", "\"msg\":\"" + cmd + "\"");
+    flash(120, 120, 120, 1, 120);
   }
-  ledIdle();
+  rgbOff();
 }
 
 void onMqttMessage(int size) {
@@ -241,6 +267,7 @@ void onMqttMessage(int size) {
   while (mqtt.available()) payload += (char)mqtt.read();
 
   Serial.println("MQTT [" + topic + "] " + payload);
+  gotAnything = true;
   flash(160, 160, 160, 1, 70);                       // white flash: something arrived
 
   handleCommand(payload);
@@ -253,7 +280,9 @@ bool mqttConnect() {
   net.setInsecure();                                 // no certificate pinning
   mqtt.setId(CLIENT_ID);
   mqtt.setUsernamePassword(MQTT_USER, MQTT_PASS);
-  mqtt.setKeepAliveInterval(60000);
+  mqtt.setCleanSession(false);                       // the broker holds messages
+                                                     // for us while we sleep
+  mqtt.setKeepAliveInterval(120000);
   mqtt.setConnectionTimeout(8000);
   mqtt.onMessage(onMqttMessage);
 
@@ -266,13 +295,11 @@ bool mqttConnect() {
   mqttUp = true;
   Serial.println("MQTT connected");
 
-  mqtt.subscribe(topicSub(), 1);
-  mqtt.subscribe(topicSubAll(), 1);
+  mqtt.subscribe(topicSub(), 1);                     // QoS 1, so offline
+  mqtt.subscribe(topicSubAll(), 1);                  // messages are queued for us
   Serial.println("subscribed to " + topicSub());
 
-  flash(0, 200, 0, 3, 80);                           // green triple: subscribed
-  publishState("boot", "ready");
-  ledIdle();
+  flash(0, 200, 0, 2, 70);                           // green: subscribed
   return true;
 }
 
@@ -305,11 +332,79 @@ bool wifiConnect(unsigned long timeoutMs) {
 // ================================================================
 //  SETUP / LOOP
 // ================================================================
+//  Everything happens in setup(). The board wakes, does its round, and
+//  sleeps again, so loop() only runs when SLEEP_SECONDS is 0.
+
+void goToSleep(const char* why) {
+  Serial.printf("sleeping %d s (%s)\n\n", SLEEP_SECONDS, why);
+
+  if (mqttUp) {
+    say("sleep", String("\"sec\":") + String(SLEEP_SECONDS) + ",\"why\":\"" + why + "\"");
+    delay(150);                       // let the packet leave before we drop the link
+    mqtt.stop();
+  }
+
+  rgbOff();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  Serial.flush();
+
+#if SLEEP_SECONDS > 0
+  esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_SECONDS * 1000000ULL);
+  esp_deep_sleep_start();
+#endif
+}
+
+// One full round: connect, announce, collect, act, sleep
+void doRound() {
+  gotAnything = false;
+
+  if (!wifiConnect(20000)) {
+    breathe(200, 0, 0, 700);
+    goToSleep("no wifi");
+    return;
+  }
+
+  if (!mqttConnect()) {
+    breathe(200, 0, 0, 700);
+    goToSleep("no broker");
+    return;
+  }
+
+  // "I am awake" - this is the line you watch on the ack topic
+  say("wake", "");
+
+  // Anything published while we were asleep is delivered right after the
+  // subscribe, so a short listen is enough.
+  unsigned long t0 = millis();
+  while (millis() - t0 < WAIT_FOR_MSG_MS) {
+    mqtt.poll();
+    if (gotAnything) break;
+    delay(10);
+  }
+
+  if (!gotAnything) {
+    Serial.println("nothing waiting");
+    flash(0, 0, 180, 1, 80);          // blue blip, then straight back to sleep
+    goToSleep("idle");
+    return;
+  }
+
+  // something arrived and has been acted on: give a moment for more
+  unsigned long t1 = millis();
+  while (millis() - t1 < WAIT_FOR_MORE_MS) {
+    mqtt.poll();
+    delay(10);
+  }
+
+  goToSleep("done");
+}
 
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("\n=== NEXUS servo node ===");
+  wakeCount++;
+  Serial.printf("\n=== NEXUS servo node, wake #%lu ===\n", (unsigned long)wakeCount);
 
   // hand every LEDC timer to the ESP32Servo library, which then shares
   // them between the servo and the three LED channels
@@ -319,45 +414,22 @@ void setup() {
   ESP32PWM::allocateTimer(3);
 
   ledBegin();
-  flash(60, 60, 60, 1, 150);                         // brief white: alive
+  flash(60, 60, 60, 1, 90);           // white blip: awake
 
-  servoBegin();                                      // park at 90
+  servoBegin();                       // park at 90
 
-  if (!wifiConnect(30000)) {
-    // keep trying, the loop will pick it up
-  }
+  doRound();                          // with SLEEP_SECONDS > 0 this never returns
 }
 
 void loop() {
-  // ---- WiFi ----
-  if (WiFi.status() != WL_CONNECTED) {
-    mqttUp = false;
-    breathe(200, 0, 0, 800);                         // red breathing: offline
-    static unsigned long lastTry = 0;
-    if (millis() - lastTry > 15000UL) {
-      lastTry = millis();
-      WiFi.disconnect();
-      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    }
-    return;
+#if SLEEP_SECONDS == 0
+  static unsigned long last = 0;
+  if (millis() - last > 15000UL) {    // stay-awake mode: repeat every 15 s
+    last = millis();
+    wakeCount++;
+    doRound();
   }
-
-  // ---- MQTT ----
-  if (!mqttUp) {
-    if (millis() >= nextMqttTry) {
-      nextMqttTry = millis() + 10000UL;
-      if (!mqttConnect()) breathe(200, 0, 0, 600);
-    }
-    return;
-  }
-
-  if (!mqtt.connected()) {
-    Serial.println("MQTT lost");
-    mqttUp = false;
-    nextMqttTry = millis() + 3000UL;
-    return;
-  }
-
-  mqtt.poll();
-  delay(5);
+  if (mqttUp) mqtt.poll();
+  delay(10);
+#endif
 }
