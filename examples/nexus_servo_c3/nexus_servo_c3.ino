@@ -564,12 +564,21 @@ const F=['mode','sleep','listen','nmin','slong','sshort','sbelow','d1m','d1h','d
          'sub_t','pub_t','cid','arest','aon','aoff','led','wssid','mhost','mport','muser'];
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 function modeUI(){const a=$('mode').value==='0';$('autoBox').style.display=a?'':'none';$('manualBox').style.display=a?'none':''}
+let filled=false;
 async function load(){
   const s=await (await fetch('/api/cfg',{cache:'no-store'})).json();
-  F.forEach(k=>{if(s[k]!==undefined)$(k).value=s[k]});
-  modeUI();
+  // Fill the form ONCE. Refilling on every poll would overwrite whatever
+  // you are in the middle of changing, a second after you change it.
+  if(!filled){
+    F.forEach(k=>{if(s[k]!==undefined)$(k).value=s[k]});
+    modeUI();
+    filled=true;
+  }
   $('sub').textContent='config mode  ·  '+s.ip;
   const rows={'IP':s.ip,'MAC':s.mac,'Signal':s.rssi+' dBm','Wakes':s.wake,
+              'State':s.state,
+              'Time left':s.state==='countdown'?(s.remain+' min'):'-',
+              'Next wake':s.next_min+' min ('+s.sched+')',
               'Servo angle':s.angle+'°','Last command':s.last,
               'Broker':s.mqtt?'connected':'not connected','Uptime':s.up+' s'};
   $('st').innerHTML=Object.entries(rows).map(([k,v])=>'<span>'+k+'</span><span>'+esc(v)+'</span>').join('');
@@ -582,6 +591,7 @@ async function save(){
   if($('mpass').value)d.mpass=$('mpass').value;
   $('msg').textContent='saving...';
   await post('/api/save',d);
+  filled=false;                    // re-read the saved values if we are still up
   $('msg').textContent='Saved. Rebooting into the normal sleep cycle.';
 }
 async function reboot(){await post('/api/reboot',{});$('msg').textContent='Rebooting.'}
